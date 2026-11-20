@@ -1,9 +1,13 @@
 /** Typed access to the plugin's preferences (defaults in addon/prefs.js). */
-import { config } from "../package.json";
+import pkg from "../package.json";
+
+const { config } = pkg;
 
 interface Prefs {
   deviceToken: string;
   deviceId: string;
+  selectedLibraries: string;
+  accountBindings: string;
   folder: string;
   syncTag: string;
   appendNotesPages: boolean;

@@ -20,8 +20,7 @@ Zotero ──── PDF + Zotero highlights/notes ────▶ reMarkable
 - Appends a **"Zotero notes"** page with each comment (numbered to match the tags)
   plus the item's child notes, so you can read them on the tablet.
 - When you change annotations or notes in Zotero, the next sync swaps in the new PDF
-  **without losing anything you wrote on the tablet**. Only the PDF blob is
-  replaced; the reMarkable annotation layers and page map are kept.
+  while retaining the tablet annotation layers. Changes to the source PDF or an uncertain page map require review.
 
 **reMarkable → Zotero**
 
@@ -47,27 +46,17 @@ the document on the tablet:
 - Text you type on that page comes back into the Zotero note. Handwriting on the page
   is added to the note as a drawing.
 - A notebook page you add on the tablet becomes a new note, `reMarkable Note <n>`.
-- If the note and the page both changed since the last sync, nothing is lost: the
-  note and the page get Zotero's text followed by the tablet's under a
-  "Edited on reMarkable at the same time" heading.
-- Deleting the page on the tablet moves the note to Zotero's trash.
-- Deleting the note in Zotero removes the page only once the note is gone from the
-  library (emptied from the trash). A note that is only in the trash keeps its page
-  and its pairing, paused; restoring the note resumes sync.
-- Moving the note to another item also pauses it: the page stays on the tablet, and
-  moving the note back resumes sync. If the moved note is later erased from the
-  library, the page is removed.
+- When both versions change, open **Tools → Review sync conflicts**. **Keep both** preserves the Zotero note and its attachments and pairs a separate note with the tablet page. **Decide later** keeps the review across restarts.
+- Erasing a tablet page keeps its paired Zotero note. Moving or deleting the Zotero note leaves the tablet page in place.
 
 Other child notes are read-only on the tablet: they are listed on the appended
 "Zotero notes" page.
 
 ### Safety rules
 
-- Annotations and notes you made in Zotero are **never modified or deleted** by a
-  sync. Only objects the plugin imported are updated (when you change them on the
-  tablet) or removed (when you erase them on the tablet).
-- If you delete an imported annotation in Zotero, it is not re-imported.
-  _Re-import reMarkable annotations_ brings everything back.
+- Sync is opt-in for each writable library. Unchecking a library pauses its pairings and reviews.
+- Erasing a tablet annotation retains its Zotero import. A failed import stays pending. Re-import refreshes existing records in place.
+
 - The original PDF file in Zotero is never changed; the annotated copy only exists
   on the tablet.
 - Imported annotations are never burned back into the uploaded PDF, so nothing
@@ -75,14 +64,11 @@ Other child notes are read-only on the tablet: they are listed on the appended
 
 ## Install
 
-1. Download
-   [`zotero-remarkable-sync.xpi`](https://github.com/alfakini/zotero-reMarkable-plugin/releases/latest/download/zotero-remarkable-sync.xpi)
-   from the [latest release](https://github.com/alfakini/zotero-reMarkable-plugin/releases/latest)
-   (or build it, see below). Zotero checks the releases for updates automatically.
+1. Build the XPI from this checkout or use a verified [fork release](https://github.com/onirob/zotero-reMarkable-plugin/releases). Updates go to this fork.
 2. In Zotero: **Tools → Plugins → ⚙ → Install Plugin From File…**
 3. **Zotero Settings → reMarkable**: click **Get one-time code…**, sign in, copy
    the 8-letter code from <https://my.remarkable.com/device/browser/connect> and
-   click **Connect**.
+   click **Connect**. Under **Libraries to sync**, select the libraries you want to use.
 
 A reMarkable account needs a paired tablet for the cloud API to work.
 
@@ -90,13 +76,12 @@ A reMarkable account needs a paired tablet for the cloud API to work.
 
 - Right-click items (or PDFs) → **reMarkable → Sync with reMarkable**. This uploads
   them on the first run and syncs both ways afterwards.
-- **Tools → Sync with reMarkable** syncs every item already on the tablet, plus all
+- **Tools → Sync with reMarkable** syncs tracked attachments in selected libraries, plus eligible
   items tagged `reMarkable` (the tag can be changed in settings).
 - Set **Sync automatically every N minutes** for background sync.
 - **reMarkable → Remove from reMarkable** moves the document to the tablet's trash.
   Annotations already imported stay in Zotero.
-- **Delete annotations imported from reMarkable** removes the imported objects
-  and does not bring them back.
+- **Delete annotations imported from reMarkable** previews unchanged, verified imports before moving them to Zotero Trash.
 
 ## How it works
 
@@ -105,15 +90,14 @@ A reMarkable account needs a paired tablet for the cloud API to work.
   headers, compare-and-swap root updates with retry on generation conflicts).
 - `src/remarkable/rmscene.ts` is a reader for v6 `.rm` files: tagged blocks, the
   CRDT scene tree, Line v1/v2 points, GlyphRange highlights, ARGB colours (Paper
-  Pro) and typed text. Unknown blocks and fields are skipped by length, so newer
-  firmware degrades gracefully.
+  Pro) and typed text. Unrecognized scene blocks and incomplete pages require review.
 - `src/sync/convert.ts` maps tablet coordinates to PDF points:
   `x_pt = cropX + w/2 + x·72/226`, `y_pt = cropTop − y·72/226`.
 - `src/sync/pdfExport.ts` burns Zotero annotations into the PDF with `pdf-lib`.
 - `src/sync/engine.ts` runs a pull, then a push, per attachment. State lives in
-  `<Zotero data dir>/remarkable-sync/state.json`.
+  account-specific files under `<Zotero data dir>/remarkable-sync/`.
 
-The device token is stored in Zotero's preferences (`extensions.zotero.zoteroremarkable.deviceToken`).
+The device token is stored in the application’s credential manager. Upgrading verifies the saved credential before clearing the old preference.
 
 ## Develop
 
@@ -136,7 +120,7 @@ The pushed tag runs `.github/workflows/release.yml`, which tests and builds the
 plugin, creates the GitHub release `vX.Y.Z` with `zotero-remarkable-sync.xpi`
 attached, and updates `update.json` on the `release` release (the plugin's
 `update_url`, used by Zotero for automatic updates). Versions with a `-` suffix
-are published as pre-releases.
+use a separate beta update manifest.
 
 `scripts/pull-preview.mts` downloads a document, runs the import conversion and
 writes a PDF with the result drawn on top, which is handy for checking coordinates.
@@ -147,7 +131,7 @@ projects.
 ## Limitations
 
 - **One machine.** Sync state lives in the Zotero data directory
-  (`remarkable-sync/state.json`). Syncing the same library from two computers
+  under `remarkable-sync/`. Syncing the same library from two computers
   duplicates documents and annotations.
 - **Unofficial protocol.** The reMarkable cloud sync protocol and the `.rm` format are
   reverse-engineered and can break with a firmware or cloud change. The `.rm` text
@@ -165,10 +149,9 @@ projects.
 - **Large PDFs** are rebuilt on Zotero's main thread, so Zotero can freeze for a while
   (the plugin warns for files of 50 MB or more).
 - Freehand highlighter strokes become area highlights without text.
-- Images and stickers placed on pages (newer firmware) are ignored.
+- Pages containing unsupported scene blocks require review.
 - EPUBs are not supported, only PDFs.
-- Documents moved to the tablet's trash are still synced until they are emptied from
-  the trash.
+- A missing or trashed tablet document requires review.
 - Group libraries are untested.
 
 ## Credits

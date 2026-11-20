@@ -1,5 +1,7 @@
 /** Strings from addon/locale/<lang>/addon.ftl. */
-import { config } from "../package.json";
+import pkg from "../package.json";
+
+const { config } = pkg;
 
 let bundle: Localization | undefined;
 

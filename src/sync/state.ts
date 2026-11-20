@@ -6,9 +6,14 @@
  * never touches annotations the user made in Zotero.
  */
 
+import { rememberReview, reviewId, type SyncReview } from "./review";
+import type { DrawingIntent } from "./drawingJournal";
 import { buildDetachedList } from "./detached";
 
 export interface ImportedRecord {
+  localHash?: string;
+  drawingKey?: string;
+  removedOnTablet?: boolean;
   /** Zotero annotation or note key. */
   zoteroKey: string;
   /** Fingerprint of the reMarkable source; changes when the item changes. */
@@ -17,6 +22,10 @@ export interface ImportedRecord {
 }
 
 export interface NotePageRecord {
+  owned?: boolean;
+  tabletStyles?: string;
+  zoteroStyles?: string;
+  removedOnTablet?: boolean;
   /** Key of the paired Zotero child note. */
   noteKey: string;
   /** Body text both sides had after the last sync (three-way merge base). */
@@ -33,6 +42,15 @@ export interface NotePageRecord {
 }
 
 export interface DocState {
+  sourcePdfHash?: string;
+  tabletPdfHash?: string;
+  pendingTabletPdfHash?: string;
+  reviews?: Record<string, SyncReview>;
+  drawingJournal?: Record<string, DrawingIntent>;
+  drawingDigests?: Record<string, string>;
+  retainedNotes?: string[];
+  pendingKeys?: Record<string, string>;
+  pendingPages?: Record<string, { id: string; base: string }>;
   attachmentKey: string;
   libraryID: number;
   rmDocId: string;
@@ -74,6 +92,7 @@ export interface DocState {
 interface StateFile {
   version: 1;
   docs: Record<string, DocState>;
+  pending?: Record<string, { libraryID: number; attachmentKey: string }>;
   /** Tablet folder id by folder name; optional, absent in older files. */
   folders?: Record<string, string>;
   /**
@@ -123,34 +142,164 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 function parseState(text: string): StateFile {
+  if (text.length > 64 * 1024 * 1024)
+    throw new Error("Sync state exceeds size limit");
   const data = JSON.parse(text) as StateFile;
-  if (
-    !isPlainObject(data) ||
-    (data.docs !== undefined && !isPlainObject(data.docs))
-  )
+  if (!isPlainObject(data) || data.version !== 1 || !isPlainObject(data.docs))
     throw new Error("unexpected state file layout");
-  normaliseState(data);
+  const strings = (value: unknown): value is string[] =>
+    Array.isArray(value) &&
+    value.every((v) => typeof v === "string" && v.length > 0);
+  const stringMap = (value: unknown) =>
+    value === undefined ||
+    (isPlainObject(value) &&
+      Object.values(value).every((v) => typeof v === "string" && v.length > 0));
+  if (
+    !stringMap(data.folders) ||
+    (data.detached !== undefined &&
+      (!isPlainObject(data.detached) ||
+        !Object.values(data.detached).every(strings)))
+  )
+    throw new Error("Invalid folder or detached ownership registry");
+  if (
+    data.pending !== undefined &&
+    (!isPlainObject(data.pending) ||
+      Object.entries(data.pending).some(
+        ([key, pair]) =>
+          !pair ||
+          !Number.isSafeInteger(pair.libraryID) ||
+          typeof pair.attachmentKey !== "string" ||
+          key !== stateKey(pair.libraryID, pair.attachmentKey),
+      ))
+  )
+    throw new Error("Invalid pending attachment");
+  const docIds = new Set<string>();
+  for (const [key, doc] of Object.entries(data.docs)) {
+    if (
+      !doc ||
+      !Number.isSafeInteger(doc.libraryID) ||
+      doc.libraryID < 1 ||
+      !doc.attachmentKey ||
+      key !== stateKey(doc.libraryID, doc.attachmentKey) ||
+      typeof doc.rmDocId !== "string" ||
+      !doc.rmDocId ||
+      docIds.has(doc.rmDocId)
+    )
+      throw new Error("Invalid or ambiguous document pairing");
+    docIds.add(doc.rmDocId);
+    if (
+      !Number.isSafeInteger(doc.originalPageCount) ||
+      doc.originalPageCount < 0 ||
+      !Number.isSafeInteger(doc.appendedPageCount) ||
+      doc.appendedPageCount < 0 ||
+      !Array.isArray(doc.pageBoxes) ||
+      doc.pageBoxes.some(
+        (b) =>
+          !b ||
+          ![b.x, b.y, b.width, b.height].every(Number.isFinite) ||
+          b.width <= 0 ||
+          b.height <= 0,
+      )
+    )
+      throw new Error("Invalid PDF dimensions in sync state");
+    if (
+      !isPlainObject(doc.imported) ||
+      Object.values(doc.imported).some(
+        (r) =>
+          !r ||
+          typeof r.zoteroKey !== "string" ||
+          !r.zoteroKey ||
+          typeof r.hash !== "string" ||
+          !["annotation", "note"].includes(r.kind),
+      ) ||
+      (doc.notePages !== undefined &&
+        (!isPlainObject(doc.notePages) ||
+          Object.values(doc.notePages).some(
+            (r) =>
+              !r ||
+              typeof r.noteKey !== "string" ||
+              (r.owned !== undefined && typeof r.owned !== "boolean"),
+          ))) ||
+      !stringMap(doc.pendingKeys) ||
+      (doc.pendingPages !== undefined &&
+        (!isPlainObject(doc.pendingPages) ||
+          Object.values(doc.pendingPages).some(
+            (p) => !p || typeof p.id !== "string" || typeof p.base !== "string",
+          ))) ||
+      (doc.retainedNotes !== undefined && !strings(doc.retainedNotes)) ||
+      (doc.detachedImported !== undefined && !strings(doc.detachedImported))
+    )
+      throw new Error("Invalid imported object ownership");
+    if (
+      !stringMap(doc.drawingDigests) ||
+      (doc.drawingJournal !== undefined &&
+        (!isPlainObject(doc.drawingJournal) ||
+          Object.entries(doc.drawingJournal).some(
+            ([key, intent]) =>
+              !intent ||
+              key !== intent.noteKey ||
+              typeof intent.pageId !== "string" ||
+              typeof intent.before !== "string" ||
+              !Array.isArray(intent.attachments) ||
+              !intent.attachments.every(Number.isSafeInteger) ||
+              !intent.target ||
+              typeof intent.target.id !== "string" ||
+              (intent.target.kind === "page"
+                ? !intent.target.record || intent.target.record.noteKey !== key
+                : intent.target.kind !== "import" ||
+                  typeof intent.target.hash !== "string") ||
+              (intent.replacement !== undefined &&
+                (!intent.replacement ||
+                  typeof intent.replacement.key !== "string" ||
+                  typeof intent.replacement.digest !== "string" ||
+                  typeof intent.replacement.owned !== "boolean")) ||
+              (intent.recorded && !intent.after),
+          )))
+    )
+      throw new Error("Invalid drawing recovery state");
+    const legacy = doc as DocState & { review?: SyncReview };
+    const validReview = (review: SyncReview) =>
+      !!review &&
+      typeof review.reason === "string" &&
+      typeof review.location === "string" &&
+      typeof review.revision === "string" &&
+      (review.pageId === undefined || typeof review.pageId === "string") &&
+      Array.isArray(review.choices) &&
+      review.choices.length > 0 &&
+      review.choices.every((choice) =>
+        [
+          "Retry",
+          "Keep both",
+          "Use tablet version",
+          "Use Zotero version",
+        ].includes(choice),
+      ) &&
+      (review.decision === undefined ||
+        review.choices.includes(review.decision));
+    if (
+      doc.reviews !== undefined &&
+      (!isPlainObject(doc.reviews) ||
+        Object.entries(doc.reviews).some(
+          ([id, review]) => !validReview(review) || reviewId(review) !== id,
+        ))
+    )
+      throw new Error("Invalid pending reviews");
+    if (legacy.review !== undefined) {
+      const review = legacy.review;
+      if (!validReview(review)) throw new Error("Invalid legacy review");
+      const candidatePage = review.location.includes("/")
+        ? review.location.split("/")[0]
+        : undefined;
+      review.pageId =
+        candidatePage ??
+        (Object.hasOwn(doc.notePages ?? {}, review.location)
+          ? review.location
+          : undefined);
+      rememberReview(doc, review);
+      delete legacy.review;
+    }
+  }
   return data;
-}
-
-/**
- * `folders` and `detached` are optional extras. A malformed value (a string,
- * an array, entries of the wrong type) is dropped rather than treated as
- * corruption, so the rest of the state is kept and later writes cannot throw.
- */
-function normaliseState(data: StateFile) {
-  const folders: Record<string, string> = {};
-  if (isPlainObject(data.folders))
-    for (const [name, id] of Object.entries(data.folders))
-      if (typeof id === "string") folders[name] = id;
-  data.folders = folders;
-
-  const detached: Record<string, string[]> = {};
-  if (isPlainObject(data.detached))
-    for (const [id, keys] of Object.entries(data.detached))
-      if (Array.isArray(keys) && keys.every((k) => typeof k === "string"))
-        detached[id] = keys;
-  data.detached = detached;
 }
 
 export class SyncStateStore {
@@ -173,6 +322,27 @@ export class SyncStateStore {
     io?: StateFileIO,
   ) {
     this.io = io ?? zoteroStateIO();
+  }
+
+  static async migrateLegacy(from: string, to: string, io = zoteroStateIO()) {
+    const existing = new SyncStateStore(to, io);
+    if (await io.exists(to)) {
+      await existing.load();
+      return;
+    }
+    if (!(await io.exists(from)) && !(await io.exists(from + ".bak"))) return;
+    const legacy = new SyncStateStore(from, io);
+    await legacy.load();
+    const source = (await io.exists(from)) ? from : from + ".bak";
+    const raw = await io.readText(source);
+    parseState(raw);
+    const backup = from + ".before-library-selection";
+    if (!(await io.exists(backup))) await io.copy(source, backup);
+    if ((await io.readText(backup)) !== raw)
+      throw new Error("Legacy state backup differs from the original");
+    await io.writeText(to, raw);
+    if ((await io.readText(to)) !== raw)
+      throw new Error("Could not verify migrated sync state");
   }
 
   private get backupPath() {
@@ -283,12 +453,26 @@ export class SyncStateStore {
     this.lastWritten = text;
   }
 
+  pendingAttachments() {
+    return Object.values(this.data.pending ?? {});
+  }
+
+  queue(libraryID: number, attachmentKey: string) {
+    this.data.pending ??= {};
+    this.data.pending[stateKey(libraryID, attachmentKey)] = {
+      libraryID,
+      attachmentKey,
+    };
+  }
+
   get(libraryID: number, attachmentKey: string): DocState | undefined {
     return this.data.docs[stateKey(libraryID, attachmentKey)];
   }
 
   set(doc: DocState) {
-    this.data.docs[stateKey(doc.libraryID, doc.attachmentKey)] = doc;
+    const key = stateKey(doc.libraryID, doc.attachmentKey);
+    this.data.docs[key] = doc;
+    if (this.data.pending) delete this.data.pending[key];
   }
 
   private delete(libraryID: number, attachmentKey: string) {
@@ -302,7 +486,12 @@ export class SyncStateStore {
    */
   forget(libraryID: number, attachmentKey: string) {
     const doc = this.get(libraryID, attachmentKey);
-    if (doc) this.addDetached(libraryID, attachmentKey, buildDetachedList(doc));
+    if (doc)
+      this.addDetached(libraryID, attachmentKey, [
+        ...buildDetachedList(doc),
+        ...Object.values(doc.notePages ?? {}).map((r) => r.noteKey),
+        ...(doc.retainedNotes ?? []),
+      ]);
     this.delete(libraryID, attachmentKey);
   }
 

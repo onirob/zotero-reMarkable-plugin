@@ -15,6 +15,7 @@
  *    or written outside the PDF page        -> child note with an SVG drawing
  *                                             of the handwriting (+ typed text).
  */
+import { splitInk } from "./inkFit";
 import type { RmPageRef } from "../remarkable/content";
 import {
   isEraser,
@@ -36,7 +37,7 @@ import type { PageBox, ZPosition } from "./types";
  * 4: respace output (ligatures, astral characters, page splitting), ink
  *    fitting, the import tag, annotation/comment merging and note output.
  */
-export const CONVERTER_VERSION = 4;
+export const CONVERTER_VERSION = 5;
 
 /** reMarkable units per PDF point (rM2 / Paper Pro render PDFs at 226 dpi). */
 export const RM_DPI = 226;
@@ -314,22 +315,10 @@ function unionFind(
   const groups = new Map<number, number[]>();
   for (let i = 0; i < n; i++) {
     const root = find(i);
-    groups.set(root, [...(groups.get(root) ?? []), i]);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)!.push(i);
   }
   return [...groups.values()];
-}
-
-/** Drop points closer than `minDist` PDF points to keep positions compact. */
-function simplify(path: number[], minDist = 0.4): number[] {
-  if (path.length <= 4) return path;
-  const out = [path[0], path[1]];
-  for (let i = 2; i < path.length - 2; i += 2) {
-    const dx = path[i] - out[out.length - 2];
-    const dy = path[i + 1] - out[out.length - 1];
-    if (dx * dx + dy * dy >= minDist * minDist) out.push(path[i], path[i + 1]);
-  }
-  out.push(path[path.length - 2], path[path.length - 1]);
-  return out;
 }
 
 // ----------------------------------------------------------- conversion ---
@@ -453,7 +442,7 @@ export function convertPages(input: ConvertInput): Candidate[] {
         continue;
       }
       const paths = cluster.map((l) =>
-        simplify(l.points.flatMap((p) => [r3(tf.x(p.x)), r3(tf.y(p.y))])),
+        l.points.flatMap((p) => [r3(tf.x(p.x)), r3(tf.y(p.y))]),
       );
       const widths = cluster.map(avgWidth).sort((a, c) => a - c);
       const width = Math.max(
@@ -469,12 +458,15 @@ export function convertPages(input: ConvertInput): Candidate[] {
         position: { pageIndex, width, paths },
       };
       const firstId = cluster.map((l) => l.id).sort()[0];
-      out.push({
-        kind: "annotation",
-        rmKey: `${ref.id}/i/${firstId}`,
-        hash: fingerprint(json),
-        json,
-      });
+      for (const [i, position] of splitInk(json.position).entries()) {
+        const part = { ...json, position };
+        out.push({
+          kind: "annotation",
+          rmKey: `${ref.id}/i/${firstId}${i ? "/part-" + (i + 1) : ""}`,
+          hash: fingerprint(part),
+          json: part,
+        });
+      }
     }
 
     // Typed text on a PDF page -> sticky note at the text box position.

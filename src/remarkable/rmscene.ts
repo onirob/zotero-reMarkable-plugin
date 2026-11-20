@@ -176,12 +176,14 @@ class Reader {
     this.need(4);
     const v = this.view.getFloat32(this.pos, true);
     this.pos += 4;
+    if (!Number.isFinite(v)) throw new RmParseError("Invalid coordinate");
     return v;
   }
   f64() {
     this.need(8);
     const v = this.view.getFloat64(this.pos, true);
     this.pos += 8;
+    if (!Number.isFinite(v)) throw new RmParseError("Invalid coordinate");
     return v;
   }
   bytes(n: number) {
@@ -198,11 +200,13 @@ class Reader {
       const b = this.u8();
       result += (b & 0x7f) * mul;
       if (!(b & 0x80)) return result;
+      if (mul >= 2 ** 63) throw new RmParseError("Invalid integer");
       mul *= 128;
     }
   }
   /** Highest CRDT counter seen (sentinels near 2^64 are ignored). */
   maxCounter = 0;
+  points = 0;
 
   crdtId(): CrdtId {
     const id = { part1: this.u8(), part2: this.varuint() };
@@ -288,7 +292,9 @@ class TaggedReader {
     if (end > this.end) throw new RmParseError("subblock overruns parent");
     this.ends.push(end);
     try {
-      return fn(len);
+      const result = fn(len);
+      if (this.r.pos > end) throw new RmParseError("Field exceeds block");
+      return result;
     } finally {
       this.ends.pop();
       this.r.pos = end;
@@ -330,7 +336,9 @@ class TaggedReader {
     const end = this.r.pos + len;
     this.ends.push(Math.min(end, this.r.length));
     try {
-      return fn();
+      const result = fn();
+      if (this.r.pos > end) throw new RmParseError("Field exceeds block");
+      return result;
     } finally {
       this.ends.pop();
       this.r.pos = end;
@@ -367,6 +375,9 @@ function readPoints(t: TaggedReader, version: number): RmPoint[] {
     const size = version === 1 ? 24 : 14;
     if (len % size) throw new RmParseError(`bad point data length ${len}`);
     const r = t.r;
+    r.points += len / size;
+    if (r.points > 400000)
+      throw new RmParseError("Page exceeds the handwriting point limit");
     const out: RmPoint[] = [];
     for (let i = 0; i < len / size; i++) {
       if (version === 1) {
@@ -455,8 +466,12 @@ function readRootTextBlock(t: TaggedReader): RmText {
             const deleted = t.int(5);
             let value: string | number = "";
             if (t.hasSubblock(6)) value = t.stringWithFormat(6);
+            if (typeof value === "string" && value.length > 200000)
+              throw new RmParseError("Text exceeds page limit");
             const runLen =
               typeof value === "number" ? 1 : [...value].length || deleted;
+            if (chars.length + runLen > 100000)
+              throw new RmParseError("Text exceeds page limit");
             const glyphs = typeof value === "number" ? [value] : [...value];
             // Each character of a run consumes a counter value.
             const lastCounter = id.part2 + runLen - 1;
@@ -512,7 +527,7 @@ function readRootTextBlock(t: TaggedReader): RmText {
   });
   const pos = t.subblock(3, () => ({ x: t.r.f64(), y: t.r.f64() }));
   const width = t.float(4);
-  const ordered = toposort(chars);
+  const ordered = toposort(chars, true);
   const paragraphs: RmParagraph[] = [];
   let current: RmParagraph = {
     style: styles.get("0:0") ?? ParagraphStyle.PLAIN,
@@ -545,8 +560,19 @@ function readRootTextBlock(t: TaggedReader): RmText {
  */
 export function toposort<T extends { id: string; left: string; right: string }>(
   items: T[],
+  strict = false,
 ): T[] {
   const byId = new Map(items.map((i) => [i.id, i]));
+  if (
+    strict &&
+    (byId.size !== items.length ||
+      items.some((item) =>
+        [item.left, item.right].some(
+          (id) => id !== END_MARKER && !byId.has(id),
+        ),
+      ))
+  )
+    throw new RmParseError("Text sequence has unresolved references");
   const side = (id: string, s: "left" | "right") =>
     id === END_MARKER ? (s === "left" ? "__start" : "__end") : id;
   // Nodes get a stable index in first-seen order; prerequisites are sets so a
@@ -605,6 +631,8 @@ export function toposort<T extends { id: string; left: string; right: string }>(
     wave = next.sort((x, y) => x - y);
   }
   // Anything left (malformed links) is appended rather than dropped.
+  if (strict && out.length !== items.length)
+    throw new RmParseError("Invalid text order");
   if (out.length < items.length) {
     const seen = new Set(out.map((i) => i.id));
     for (const i of items) if (!seen.has(i.id)) out.push(i);
@@ -629,6 +657,8 @@ export function parseRm(data: Uint8Array): RmPage {
   if (header !== HEADER) {
     throw new RmParseError(`unsupported .rm file (header "${header.trim()}")`);
   }
+  if (data.length < 43 || data.length > 16 * 1024 * 1024)
+    throw new RmParseError("Invalid page length");
   const r = new Reader(data);
   r.pos = 43;
   const t = new TaggedReader(r);
@@ -637,76 +667,96 @@ export function parseRm(data: Uint8Array): RmPage {
   let text: RmText | undefined;
   const authors: RmPage["authors"] = [];
   const hidden = new Set<string>();
+  const deleted = new Set<string>();
   /** child group -> parent group */
   const groupParent = new Map<string, string>();
 
+  let blocks = 0;
   while (r.pos + 8 <= r.length) {
+    if (++blocks > 50000) throw new RmParseError("Page exceeds block limit");
     const len = r.u32();
     r.u8(); // unknown
-    r.u8(); // min version
+    const minimumVersion = r.u8();
     const version = r.u8();
     const type = r.u8();
-    if (r.pos + len > r.length) break;
-    try {
-      t.block(len, () => {
-        switch (type) {
-          case BLOCK.TreeNode: {
-            const id = idKey(t.id(1));
-            t.lww(2, (x) => x.string(2)); // label
-            const visible = t.lww(3, (x) => x.bool(2));
-            if (!visible) hidden.add(id);
-            break;
-          }
-          case BLOCK.GroupItem: {
-            const env = readItemEnvelope(t);
-            if (!t.hasSubblock(6)) break;
-            t.subblock(6, () => {
-              t.r.u8(); // item type
-              groupParent.set(idKey(t.id(2)), env.parent);
-            });
-            break;
-          }
-          case BLOCK.LineItem: {
-            const env = readItemEnvelope(t);
-            if (!t.hasSubblock(6)) break; // deleted
-            t.subblock(6, () => {
-              if (t.r.u8() !== 3) return;
-              lines.push(readLine(t, env, version));
-            });
-            break;
-          }
-          case BLOCK.GlyphItem: {
-            const env = readItemEnvelope(t);
-            if (!t.hasSubblock(6)) break;
-            t.subblock(6, () => {
-              if (t.r.u8() !== 1) return;
-              glyphs.push(readGlyph(t, env));
-            });
-            break;
-          }
-          case BLOCK.AuthorIds: {
-            const n = t.r.varuint();
-            for (let i = 0; i < n; i++) {
-              t.subblock(0, () => {
-                const len = t.r.varuint();
-                const uuid = t.r.bytes(len).slice();
-                authors.push({ id: t.r.u16(), uuid });
-              });
-            }
-            break;
-          }
-          case BLOCK.RootText:
-            text = readRootTextBlock(t);
-            break;
-          default:
-            break; // skipped by t.block
+    if (
+      minimumVersion >
+      (type === BLOCK.LineItem || type === BLOCK.TreeNode ? 2 : 1)
+    )
+      throw new RmParseError("Unsupported block version");
+    if (r.pos + len > r.length) throw new RmParseError("Truncated page block");
+    t.block(len, () => {
+      switch (type) {
+        case BLOCK.TreeNode: {
+          const id = idKey(t.id(1));
+          t.lww(2, (x) => x.string(2)); // label
+          const visible = t.lww(3, (x) => x.bool(2));
+          if (!visible) hidden.add(id);
+          break;
         }
-      });
-    } catch (e) {
-      if (!(e instanceof RmParseError)) throw e;
-      // Corrupt or unknown variant: block end is known, so carry on.
-    }
+        case BLOCK.GroupItem: {
+          const env = readItemEnvelope(t);
+          if (!t.hasSubblock(6)) break;
+          t.subblock(6, () => {
+            t.r.u8(); // item type
+            groupParent.set(idKey(t.id(2)), env.parent);
+          });
+          break;
+        }
+        case 8: {
+          const tombstone = readItemEnvelope(t);
+          if (tombstone.deletedLength !== 1)
+            throw new RmParseError("Unsupported scene deletion");
+          deleted.add(tombstone.id);
+          break;
+        }
+        case BLOCK.LineItem: {
+          const env = readItemEnvelope(t);
+          if (!t.hasSubblock(6)) break; // deleted
+          t.subblock(6, () => {
+            if (
+              t.r.u8() !== 3 ||
+              ![1, 2].includes(version) ||
+              lines.length >= 4000
+            )
+              throw new RmParseError(
+                "Unsupported stroke or page limit exceeded",
+              );
+            lines.push(readLine(t, env, version));
+          });
+          break;
+        }
+        case BLOCK.GlyphItem: {
+          const env = readItemEnvelope(t);
+          if (!t.hasSubblock(6)) break;
+          t.subblock(6, () => {
+            if (t.r.u8() !== 1) throw new RmParseError("Unsupported highlight");
+            glyphs.push(readGlyph(t, env));
+          });
+          break;
+        }
+        case BLOCK.AuthorIds: {
+          const n = t.r.varuint();
+          for (let i = 0; i < n; i++) {
+            t.subblock(0, () => {
+              const len = t.r.varuint();
+              const uuid = t.r.bytes(len).slice();
+              authors.push({ id: t.r.u16(), uuid });
+            });
+          }
+          break;
+        }
+        case BLOCK.RootText:
+          text = readRootTextBlock(t);
+          break;
+        default:
+          if (![0, 1, 8, 10, 13].includes(type))
+            throw new RmParseError("Unsupported page block " + type);
+          break;
+      }
+    });
   }
+  if (r.pos !== r.length) throw new RmParseError("Truncated page header");
 
   const isHidden = (group: string) => {
     for (
@@ -719,8 +769,8 @@ export function parseRm(data: Uint8Array): RmPage {
     return false;
   };
   return {
-    lines: lines.filter((l) => !isHidden(l.parent)),
-    glyphs: glyphs.filter((g) => !isHidden(g.parent)),
+    lines: lines.filter((l) => !deleted.has(l.id) && !isHidden(l.parent)),
+    glyphs: glyphs.filter((g) => !deleted.has(g.id) && !isHidden(g.parent)),
     text: text?.text.trim() ? text : undefined,
     rootText: text,
     maxCounter: r.maxCounter,

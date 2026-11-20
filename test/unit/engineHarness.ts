@@ -4,7 +4,6 @@
  * implements the RemarkableCloud methods the engine calls. Not a test file
  * itself (the unit glob only picks up *.test.ts).
  */
-import { PDFDocument } from "pdf-lib";
 import type {
   ChangedDocument,
   IndexEntry,
@@ -111,6 +110,7 @@ export function installGlobals() {
 
 /** A real, valid PDF with `pages` blank pages. */
 export async function makePdf(pages: number): Promise<Uint8Array> {
+  const { PDFDocument } = await import("pdf-lib");
   const doc = await PDFDocument.create();
   for (let i = 0; i < pages; i++) doc.addPage([200, 200]);
   return doc.save();
@@ -178,6 +178,10 @@ export class FakeTablet {
           size: d.pdf.length,
         }));
       },
+      async findDocument(id: string) {
+        const d = self.docs.get(id);
+        return d ? { id, hash: d.hash } : undefined;
+      },
       async ensureFolder(name: string) {
         throw new Error(`unexpected folder ${name}`);
       },
@@ -228,7 +232,11 @@ export class FakeTablet {
         const d = self.docs.get(id);
         if (!d) return undefined;
         return {
-          content: { pageCount: d.pageCount, pages: [] },
+          hash: d.hash,
+          content: {
+            pageCount: d.pageCount,
+            pages: Array.from({ length: d.pageCount }, (_, i) => "page-" + i),
+          },
           rm: new Map<string, Uint8Array>(),
         };
       },
@@ -241,13 +249,20 @@ export function makeEngine(opts: {
   cloud: RemarkableCloud;
   state: SyncStateStore;
   lock?: Mutex;
+  eligible?: (id: number) => boolean;
+  importHandwriting?: boolean;
 }) {
   return new SyncEngine(
     opts.cloud,
     opts.state,
-    () => ({ folder: "", appendNotesPages: false, importHandwriting: false }),
+    () => ({
+      folder: "",
+      appendNotesPages: false,
+      importHandwriting: opts.importHandwriting ?? false,
+    }),
     "author",
     opts.lock,
+    opts.eligible ?? (() => true),
   );
 }
 

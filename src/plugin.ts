@@ -2,16 +2,19 @@
  * The plugin instance: created by src/index.ts when bootstrap.js loads the
  * bundle, and driven by bootstrap.js's lifecycle functions.
  */
-import { config } from "../package.json";
+import pkg from "../package.json";
 import { t } from "./l10n";
 import { onPrefsLoad } from "./modules/preferences";
 import { RemarkableService } from "./modules/service";
 import { registerMenus, registerPrefsPane } from "./modules/ui";
 import { notify } from "./notify";
 
+const { config } = pkg;
+
 export type Command =
   | "sync"
   | "syncAll"
+  | "review"
   | "reimport"
   | "removeImported"
   | "remove";
@@ -29,7 +32,8 @@ export class Plugin {
     ]);
     this.service = new RemarkableService();
     try {
-      await this.service.state.load();
+      await this.service.initialize();
+      if (this.service.connected) await this.service.state.load();
     } catch (e) {
       // An unreadable state file must not break startup. The store stays
       // unloaded, so the first sync attempt retries load() and reports it.
@@ -64,7 +68,8 @@ export class Plugin {
         Zotero.Utilities.Internal.openPreferences(`${config.addonRef}-prefs`);
         return;
       }
-      if (cmd === "sync") await service.syncSelected(items);
+      if (cmd === "review") await service.reviewConflicts();
+      else if (cmd === "sync") await service.syncSelected(items);
       else if (cmd === "syncAll") await service.syncAll();
       else if (cmd === "reimport") await service.removeImported(items, true);
       else if (cmd === "removeImported")

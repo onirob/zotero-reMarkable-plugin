@@ -20,7 +20,21 @@ async function startup({ rootURI }) {
   // The bundle registers the plugin as Zotero.__addonInstance__.
   Services.scriptloader.loadSubScript(
     `${rootURI}content/scripts/__addonRef__.js`,
-    {},
+    {
+      credentialManager: Services.logins,
+      reviewPrompt: Services.prompt,
+      createCloudTimeoutSignal: (milliseconds) => {
+        // The plugin scope has fetch but may lack window Web APIs.
+        const Signal =
+          Zotero.getMainWindow()?.AbortSignal ??
+          Services.appShell.hiddenDOMWindow.AbortSignal;
+        return Signal.timeout(milliseconds);
+      },
+      newCredential: () =>
+        Components.classes[
+          "@mozilla.org/login-manager/loginInfo;1"
+        ].createInstance(Components.interfaces.nsILoginInfo),
+    },
   );
   await Zotero.__addonInstance__.startup(rootURI);
 }

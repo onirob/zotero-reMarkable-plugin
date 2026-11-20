@@ -91,6 +91,7 @@ async function lockedPair() {
     attachmentKey: "ATTKEY01",
     libraryID: 1,
     rmDocId: "rm-doc",
+    rmDocHash: "h",
     originalPageCount: 1,
     appendedPageCount: 0,
     pageBoxes: [],
@@ -175,9 +176,9 @@ test("removeImported waits for a running sync, on the same engine and on one sha
 
     gate.resolve();
     await running;
-    assert.equal(await cleaning, 1);
-    assert.deepEqual(z.erased, ["IMPORTED"]);
-    assert.deepEqual(state.get(1, "ATTKEY01")?.imported, {});
+    assert.equal(await cleaning, 0);
+    assert.deepEqual(z.erased, []);
+    assert.ok(state.get(1, "ATTKEY01")?.imported["p1:a"]);
     assert.equal(a.busy, false);
     assert.equal(b.busy, false);
   }

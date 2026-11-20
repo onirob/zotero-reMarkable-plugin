@@ -1,8 +1,10 @@
 /** Menus (Zotero.MenuManager, Zotero 8+) and the preferences pane. */
-import { config } from "../../package.json";
+import pkg from "../../package.json";
 import { t } from "../l10n";
 import { ICON } from "../notify";
 import { plugin } from "../plugin";
+
+const { config } = pkg;
 
 const icon = ICON;
 const l10n = (id: string) => `${config.addonRef}-${id}`;
@@ -10,9 +12,12 @@ const l10n = (id: string) => `${config.addonRef}-${id}`;
 function hasPdf(items?: Zotero.Item[]) {
   return !!items?.some(
     (i) =>
-      i.isPDFAttachment() ||
-      (i.isRegularItem() &&
-        Zotero.Items.get(i.getAttachments()).some((a) => a.isPDFAttachment())),
+      plugin.service.eligible(i.libraryID) &&
+      (i.isPDFAttachment() ||
+        (i.isRegularItem() &&
+          Zotero.Items.get(i.getAttachments()).some((a) =>
+            a.isPDFAttachment(),
+          ))),
   );
 }
 
@@ -72,6 +77,12 @@ export function registerMenus() {
     pluginID: config.addonID,
     target: "main/menubar/tools",
     menus: [
+      {
+        menuType: "menuitem",
+        l10nID: l10n("menu-review"),
+        icon,
+        onCommand: () => plugin.command("review", []),
+      },
       {
         menuType: "menuitem",
         l10nID: l10n("menu-sync-all"),

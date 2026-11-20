@@ -138,23 +138,26 @@ test("without a recorded title only the title is recorded; the tablet name is ke
   assert.equal(state.get(LIB, ATT)?.pushedTitle, "Paper (new)");
 });
 
-test("a changed page count uploads a new document under a persisted id and trashes the old one", async () => {
-  const { z, io, tablet, att, boot } = await setup(2);
+test("a changed source PDF retains the old tablet and pairing pending review", async () => {
+  const { z, io, tablet, att, boot } = await setup();
   await (await boot()).engine.sync([att]);
   const [oldId] = [...tablet.docs.keys()];
-
+  const original = tablet.docs.get(oldId)?.pdf;
   z.files.set(PATH, await makePdf(3));
-  let persisted: Record<string, unknown> | undefined;
-  tablet.afterUploadCommit = () => {
-    persisted = diskState(io).docs[KEY];
-  };
-  const report = await (await boot()).engine.sync([att]);
-  assert.equal(report.uploaded, 1);
+  const { engine } = await boot();
+  assert.match((await engine.sync([att])).errors[0], /Review needed/);
+  assert.equal(diskState(io).docs[KEY].rmDocId, oldId);
+  assert.equal(tablet.docs.get(oldId)?.pdf, original);
+  const restarted = await boot();
+  assert.equal((await restarted.engine.sync([att])).uploaded, 0);
+  const review = restarted.state.get(LIB, ATT)!.reviews!.document;
+  const report = await restarted.engine.resolve(
+    att,
+    "document",
+    review.revision,
+    "Keep both",
+  );
   assert.deepEqual(report.errors, []);
-  assert.equal(tablet.count(`trash:${oldId}`), 1);
-  const [newId] = [...tablet.docs.keys()];
-  assert.notEqual(newId, oldId);
-  assert.equal(persisted?.rmDocId, newId);
-  assert.equal(persisted?.uploadedFingerprint, undefined);
-  assert.equal(diskState(io).docs[KEY].rmDocId, newId);
+  assert.equal(tablet.docs.size, 2);
+  assert.equal(tablet.docs.get(oldId)?.pdf, original);
 });

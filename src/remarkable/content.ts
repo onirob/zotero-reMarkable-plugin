@@ -18,7 +18,42 @@ interface CPage {
 
 export function pageRefs(content: any): RmPageRef[] {
   const cpages: CPage[] | undefined = content?.cPages?.pages;
-  if (Array.isArray(cpages) && cpages.length) {
+  const ids = new Set<string>();
+  const checkId = (id: string) => {
+    if (
+      typeof id !== "string" ||
+      !/^[\w-]+$/.test(id) ||
+      id in Object.prototype ||
+      ids.has(id)
+    )
+      throw new Error("Invalid or duplicate page ID");
+    ids.add(id);
+  };
+  if (content?.cPages !== undefined) {
+    if (!Array.isArray(cpages) || cpages.length > 20000)
+      throw new Error("Invalid page map");
+    const orderKeys = new Set<string>();
+    for (const page of cpages) {
+      checkId(page.id);
+      if (page.deleted && ![0, 1].includes(page.deleted.value))
+        throw new Error("Invalid page deletion flag");
+      if (
+        page.redir &&
+        (!Number.isSafeInteger(page.redir.value) || page.redir.value < -1)
+      )
+        throw new Error("Invalid PDF page reference");
+      if (page.deleted?.value !== 1) {
+        if (
+          typeof page.idx?.value !== "string" ||
+          !page.idx.value ||
+          orderKeys.has(page.idx.value)
+        )
+          throw new Error("Ambiguous page order");
+        orderKeys.add(page.idx.value);
+      }
+    }
+    if (content.pageCount !== undefined && content.pageCount !== orderKeys.size)
+      throw new Error("Incomplete page map");
     return cpages
       .filter((p) => !p.deleted || p.deleted.value === 0)
       .sort((a, b) => {
@@ -37,7 +72,25 @@ export function pageRefs(content: any): RmPageRef[] {
   }
   const pages: string[] = Array.isArray(content?.pages) ? content.pages : [];
   const redirect: number[] | undefined = content?.redirectionPageMap;
+  if (
+    !Array.isArray(content?.pages) ||
+    (!pages.length && content.pageCount !== 0) ||
+    pages.length > 20000 ||
+    (content.pageCount !== undefined && content.pageCount !== pages.length) ||
+    (redirect !== undefined &&
+      (!Array.isArray(redirect) ||
+        redirect.length !== pages.length ||
+        redirect.some((i) => !Number.isSafeInteger(i) || i < -1)))
+  )
+    throw new Error("Incomplete legacy page map");
+  if (
+    !redirect &&
+    content.originalPageCount !== undefined &&
+    content.originalPageCount !== pages.length
+  )
+    throw new Error("Legacy document needs a redirection map");
   return pages.map((id, order) => {
+    checkId(id);
     const r = redirect?.[order];
     const pdfIndex = redirect
       ? r !== undefined && r >= 0
@@ -119,8 +172,16 @@ export function reconcileContent(
   newId: () => string,
   authorId: string,
 ) {
-  if (!content?.cPages?.pages) {
-    return buildPdfContent({ pageCount, sizeInBytes, newId, authorId });
+  const refs = pageRefs(content);
+  if (!content.cPages) {
+    if (
+      content.originalPageCount !== undefined &&
+      content.originalPageCount !== pageCount
+    )
+      throw new Error("Legacy PDF page count changed");
+    if (refs.some((p) => p.pdfIndex !== undefined && p.pdfIndex >= pageCount))
+      throw new Error("Legacy page mapping changed");
+    return { ...content, sizeInBytes: String(sizeInBytes) };
   }
   const c = JSON.parse(JSON.stringify(content)); // no structuredClone in sandboxes
   const cp = c.cPages;
@@ -137,7 +198,7 @@ export function reconcileContent(
     if (typeof r !== "number") continue;
     if (r >= pageCount && !(p.deleted?.value === 1))
       p.deleted = { timestamp: ts, value: 1 };
-    else if (r < pageCount && p.deleted?.value !== 1) seen.add(r);
+    else if (r < pageCount) seen.add(r);
   }
   const maxIdx = cp.pages.reduce(
     (m: string, p: any) => (p.idx?.value > m ? p.idx.value : m),

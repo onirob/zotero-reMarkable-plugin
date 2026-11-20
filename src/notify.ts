@@ -1,11 +1,18 @@
 /** Small wrapper over Zotero's own progress popup. */
-import { config } from "../package.json";
+import pkg from "../package.json";
+
+const { config } = pkg;
 
 export const ICON = `chrome://${config.addonRef}/content/icons/icon96.png`;
 
 export interface ProgressPopup {
   update(text: string, percent?: number): void;
-  finish(text: string, failed: boolean, details?: string[]): void;
+  finish(
+    text: string,
+    failed: boolean,
+    details?: string[],
+    notices?: string[],
+  ): void;
 }
 
 export function notify(text: string, failed = false) {
@@ -29,10 +36,12 @@ export function progress(text: string): ProgressPopup {
       line.setText(text);
       if (percent !== undefined) line.setProgress(percent);
     },
-    finish(text, failed, details = []) {
+    finish(text, failed, details = [], notices = []) {
       line.setText(text);
       line.setProgress(100);
       if (failed) line.setError();
+      for (const notice of notices)
+        new win.ItemProgress(ICON, notice).setProgress(100);
       for (const d of details) new win.ItemProgress(ICON, d).setError();
       // A thrown error has no details and closes sooner than a report that
       // lists per-document errors.

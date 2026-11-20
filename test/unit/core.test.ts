@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { PDFDocument } from "pdf-lib";
 import { parseIndex, serializeIndex } from "../../src/remarkable/cloud";
 import {
   buildPdfContent,
@@ -17,7 +16,6 @@ import {
   nearestZoteroColor,
   ZOTERO_COLORS,
 } from "../../src/sync/convert";
-import { buildRemarkablePdf } from "../../src/sync/pdfExport";
 
 const fixture = (name: string) =>
   new Uint8Array(readFileSync(new URL(`../fixtures/${name}`, import.meta.url)));
@@ -206,6 +204,8 @@ test("converts a page into highlights, ink and notes", () => {
 });
 
 test("burns annotations into the PDF and appends a notes page", async () => {
+  const { PDFDocument } = await import("pdf-lib");
+  const { buildRemarkablePdf } = await import("../../src/sync/pdfExport");
   const src = await PDFDocument.create();
   src.addPage([612, 792]);
   src.addPage([612, 792]);
@@ -441,4 +441,28 @@ test("handwriting written together becomes one ink annotation", async () => {
   // Same line but far apart (opposite margins) stay separate.
   const farOnLine = [stroke("1:1", -700, 100), stroke("1:2", 600, 100)];
   assert.equal(clusterLines(farOnLine).length, 2);
+});
+
+test("legacy PDF replacement preserves page IDs, inserted pages and redirections", () => {
+  const legacy = {
+    pages: ["b", "n", "a"],
+    redirectionPageMap: [1, -1, 0],
+    originalPageCount: 2,
+    pageCount: 3,
+  };
+  const replaced = reconcileContent(
+    legacy,
+    2,
+    42,
+    () => {
+      throw new Error("regenerated a page ID");
+    },
+    "author",
+  );
+  assert.deepEqual(pageRefs(replaced), pageRefs(legacy));
+  assert.throws(
+    () => pageRefs({ ...legacy, pages: ["b", "b", "a"] }),
+    /duplicate/,
+  );
+  assert.throws(() => pageRefs({ ...legacy, redirectionPageMap: [0] }), /map/);
 });

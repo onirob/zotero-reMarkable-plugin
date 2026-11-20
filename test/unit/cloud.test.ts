@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   type IndexEntry,
   pairDevice,
@@ -8,6 +11,7 @@ import {
   RemarkableCloud,
   META_CACHE_MAX,
   RemarkableError,
+  registerDevice,
   serializeIndex,
 } from "../../src/remarkable/cloud";
 import { sha256Hex } from "../../src/remarkable/hash";
@@ -22,6 +26,84 @@ const OTHER = "22222222-2222-4222-8222-222222222222";
 // JWT-shaped token that never expires, so no auth refresh is attempted.
 const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
 const TOKEN = `${b64({ alg: "none" })}.${b64({ exp: 4102444800 })}.sig`;
+
+test("pairing and sync use window timeouts when the plugin scope lacks AbortSignal", async (t) => {
+  const timeout = t.mock.fn((milliseconds: number) =>
+    AbortSignal.abort(new Error(`mock timeout after ${milliseconds}`)),
+  );
+  const browser = { AbortSignal: { timeout } };
+  let mainWindow: typeof browser | undefined = browser;
+  let cloudTimeout: ((milliseconds: number) => AbortSignal) | undefined;
+  const bootstrap = readFileSync(
+    new URL("../../addon/bootstrap.js", import.meta.url),
+    "utf8",
+  );
+  await runInNewContext(
+    `${bootstrap}\nstartup({rootURI: "resource://test/"});`,
+    {
+      AbortSignal: undefined,
+      Zotero: {
+        getMainWindow: () => mainWindow,
+        __addonInstance__: { startup() {} },
+      },
+      Components: {
+        classes: {
+          "@mozilla.org/addons/addon-manager-startup;1": {
+            getService: () => ({ registerChrome() {} }),
+          },
+        },
+        interfaces: {},
+      },
+      Services: {
+        io: { newURI: (url: string) => url },
+        appShell: { hiddenDOMWindow: browser },
+        scriptloader: {
+          loadSubScript: (
+            _url: string,
+            scope: { createCloudTimeoutSignal: typeof cloudTimeout },
+          ) => {
+            cloudTimeout = scope.createCloudTimeoutSignal;
+          },
+        },
+      },
+    },
+  );
+  assert.ok(cloudTimeout);
+  const requests: RequestInit[] = [];
+  const fetchFn: typeof fetch = async (input, init = {}) => {
+    requests.push(init);
+    const route = new URL(String(input)).pathname;
+    if (route.endsWith("/device/new")) return new Response("test-device");
+    if (route.endsWith("/user/new")) return new Response(TOKEN);
+    return Response.json({
+      hash: "a".repeat(64),
+      generation: 1,
+      schemaVersion: 4,
+    });
+  };
+  t.mock.method(AbortSignal, "timeout", () => {
+    throw new Error("The plugin scope lacks AbortSignal.timeout");
+  });
+  const deviceToken = await registerDevice(
+    fetchFn,
+    "testcode",
+    ID,
+    cloudTimeout,
+  );
+  const cloud = new RemarkableCloud({
+    fetch: fetchFn,
+    deviceToken,
+    timeoutSignal: cloudTimeout,
+  });
+  await cloud.refreshUserToken();
+  mainWindow = undefined;
+  assert.equal((await cloud.getRoot()).generation, 1);
+  assert.deepEqual(
+    timeout.mock.calls.map(({ arguments: [ms] }) => ms),
+    [60_000, 60_000, 120_000],
+  );
+  assert.ok(requests.every(({ signal }) => signal?.aborted));
+});
 
 /** In-memory fake of the sync v3/v4 endpoints used by RemarkableCloud. */
 class FakeCloud {
@@ -392,7 +474,7 @@ test("replacePdf re-derives .content and .metadata from the document after a con
         uuids: [{ first: "33333333-3333-4333-8333-333333333333", second: 1 }],
       },
       fileType: "pdf",
-      pageCount: 1,
+      pageCount: pages.length,
     });
   await fake.clientCommit(ID, {
     [`${ID}.pdf`]: "old-pdf",
@@ -1109,4 +1191,111 @@ test("getPageIds does not show pages of an updateDocument refused as changed", a
     (e) => isTabletChangedError(e),
   );
   assert.deepEqual([...((await cloud.getPageIds(ID)) ?? [])], ["p1"]);
+});
+
+test("a blob hash mismatch discards the bytes before they enter a cache", async () => {
+  const fake = new FakeCloud();
+  const hash = await fake.store("original");
+  fake.blobs.set(hash, enc.encode("different"));
+  await assert.rejects(fake.cloud().getBlob(hash, "test.rm"), /hash mismatch/);
+});
+
+function storeLegacyIndex(fake: FakeCloud, entries: IndexEntry[]) {
+  const hash = createHash("sha256")
+    .update(
+      Buffer.concat(entries.map((entry) => Buffer.from(entry.hash, "hex"))),
+    )
+    .digest("hex");
+  const rows = entries.map(
+    ({ hash, type, id, subfiles, size }) =>
+      `${hash}:${type}:${id}:${subfiles}:${size}\n`,
+  );
+  fake.blobs.set(hash, enc.encode(`3\n${rows.join("")}`));
+  return hash;
+}
+
+test("sync reads schema 3 cloud indexes and preserves existing papers on a new upload", async () => {
+  const fake = new FakeCloud();
+  const files = [];
+  for (const [filename, contents] of [
+    [`${ID}.metadata`, metadata("Existing paper")],
+    [`${ID}.content`, '{"pages":["p1"]}'],
+    [`${ID}/p1.rm`, "existing ink"],
+  ]) {
+    files.push({
+      id: filename,
+      hash: await fake.store(contents),
+      size: enc.encode(contents).length,
+      type: "0",
+      subfiles: 0,
+    });
+  }
+  const existing = {
+    id: ID,
+    hash: storeLegacyIndex(fake, files),
+    size: files.reduce((total, file) => total + file.size, 0),
+    type: "80000000",
+    subfiles: files.length,
+  };
+  fake.rootHash = storeLegacyIndex(fake, [existing]);
+  const cloud = fake.cloud();
+  assert.equal(
+    (await cloud.readMetadata(existing))?.visibleName,
+    "Existing paper",
+  );
+  assert.equal(
+    dec.decode((await cloud.getDocumentFiles(ID))?.rm.get("p1")),
+    "existing ink",
+  );
+  const uploaded = await cloud.uploadPdf(
+    "New paper",
+    enc.encode("pdf"),
+    1,
+    "",
+    OTHER,
+  );
+  assert.deepEqual(
+    fake.rootEntries().map((entry) => [entry.id, entry.hash]),
+    [
+      [ID, existing.hash],
+      [OTHER, uploaded.hash],
+    ],
+  );
+  assert.equal(
+    (await cloud.readMetadata(existing))?.visibleName,
+    "Existing paper",
+  );
+});
+
+test("a changed child hash in a schema 3 index stops sync before writing a new root", async () => {
+  const fake = new FakeCloud();
+  const record = {
+    hash: "a".repeat(64),
+    id: ID,
+    type: "80000000",
+    subfiles: 1,
+    size: 1,
+  };
+  const verifiedHash = storeLegacyIndex(fake, [record]);
+  const verifiedBytes = fake.blobs.get(verifiedHash)!;
+  fake.rootHash = verifiedHash;
+  fake.blobs.set(
+    verifiedHash,
+    enc.encode(dec.decode(verifiedBytes).replace(record.hash, "b".repeat(64))),
+  );
+  const cloud = fake.cloud();
+  await assert.rejects(
+    cloud.updateRoot((entries) => entries),
+    /root index hash mismatch \(schema 3\)/,
+  );
+  assert.equal(fake.rootPuts, 0);
+  assert.deepEqual(fake.puts, []);
+  fake.blobs.set(verifiedHash, verifiedBytes);
+  assert.deepEqual(await cloud.getRootEntries(await cloud.getRoot()), [record]);
+});
+
+test("incomplete or ambiguous root indexes cannot authorize mutations", () => {
+  const h = "a".repeat(64);
+  assert.throws(() => parseIndex("4\n0:.:1:2\n"));
+  assert.throws(() => parseIndex(`4\n0:.:2:2\n${h}:0:p:0:1\n${h}:0:p:0:1\n`));
 });

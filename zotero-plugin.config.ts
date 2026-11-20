@@ -1,7 +1,8 @@
 import { defineConfig } from "zotero-plugin-scaffold";
 import pkg from "./package.json";
 
-const repo = "https://github.com/{{owner}}/{{repo}}/releases/download";
+const repo =
+  "https://github.com/onirob/zotero-reMarkable-plugin/releases/download";
 
 export default defineConfig({
   name: pkg.config.addonName,

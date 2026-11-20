@@ -10,3 +10,6 @@ menu-remove =
     .label = Remove from reMarkable
 menu-sync-all =
     .label = Sync with reMarkable
+
+menu-review =
+    .label = Review sync conflicts

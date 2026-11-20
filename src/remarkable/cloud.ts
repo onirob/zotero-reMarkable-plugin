@@ -7,7 +7,7 @@
  * index, a new root index, and finally compare-and-swapping the root pointer.
  */
 import { buildPdfContent, pageRefs, reconcileContent } from "./content";
-import { crc32cHeader, sha256Hex, uuid4 } from "./hash";
+import { crc32cHeader, fromHex, sha256Hex, uuid4 } from "./hash";
 import { LruCache } from "./lru";
 
 export const AUTH_HOST = "https://webapp-prod.cloud.remarkable.engineering";
@@ -136,17 +136,48 @@ export function byId(a: { id: string }, b: { id: string }) {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
-export function parseIndex(text: string): {
+export function parseIndex(
+  text: string,
+  expectedId?: string,
+): {
   schema: number;
   entries: IndexEntry[];
 } {
-  const lines = text.split("\n").filter((l) => l.length);
-  const schema = parseInt(lines.shift() ?? "3", 10);
-  if (schema === 4 && lines.length && lines[0].startsWith("0:")) lines.shift();
+  if (text.length > 8 * 1024 * 1024)
+    throw new Error("Cloud index exceeds size limit");
+  const lines = text.trimEnd().split("\n");
+  const schema = Number(lines.shift());
+  if (![3, 4].includes(schema) || lines.length > 100001)
+    throw new Error("Invalid cloud index");
+  const header = schema === 4 ? lines.shift()?.split(":") : undefined;
+  const ids = new Set<string>();
   const entries = lines.map((line) => {
-    const [hash, type, id, subfiles, size] = line.split(":");
-    return { hash, type, id, subfiles: Number(subfiles), size: Number(size) };
+    const fields = line.split(":");
+    const [hash, type, id, count, bytes] = fields;
+    if (
+      fields.length !== 5 ||
+      !/^[a-f0-9]{64}$/.test(hash) ||
+      !["0", "80000000"].includes(type) ||
+      !/^[\w. /-]+$/.test(id) ||
+      ids.has(id) ||
+      ![count, bytes].every(
+        (v) => /^\d+$/.test(v) && Number.isSafeInteger(Number(v)),
+      )
+    )
+      throw new Error("Invalid cloud index entry");
+    ids.add(id);
+    return { hash, type, id, subfiles: Number(count), size: Number(bytes) };
   });
+  if (
+    schema === 4 &&
+    (!header ||
+      header.length !== 4 ||
+      header[0] !== "0" ||
+      (expectedId !== undefined && header[1] !== expectedId) ||
+      header[2] !== String(entries.length) ||
+      header[3] !== String(entries.reduce((sum, e) => sum + e.size, 0)))
+  )
+    throw new Error("Incomplete cloud index");
   return { schema, entries };
 }
 
@@ -162,11 +193,53 @@ export function serializeIndex(id: string, entries: IndexEntry[]): string {
   return `${lines.join("\n")}\n`;
 }
 
+async function boundedBody(
+  response: Response,
+  limit: number,
+): Promise<Uint8Array> {
+  // With no mode option Gecko returns a default reader. Its declarations
+  // also include the BYOB overload, which requires a destination buffer.
+  const reader = response.body?.getReader() as
+    | ReadableStreamDefaultReader
+    | undefined;
+  if (!reader) throw new Error("Missing response body");
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    if (Number(response.headers.get("Content-Length")) > limit)
+      throw new Error("Download exceeds size limit");
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.length;
+      if (length > limit) throw new Error("Download exceeds size limit");
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  const data = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return data;
+}
+
+type TimeoutSignal = (milliseconds: number) => AbortSignal;
+const defaultTimeoutSignal: TimeoutSignal = (milliseconds) =>
+  globalThis.AbortSignal.timeout(milliseconds);
+
 export interface CloudOptions {
   fetch: FetchFn;
+  timeoutSignal?: TimeoutSignal;
   deviceToken: string;
   userToken?: string;
-  onUserToken?: (token: string) => void;
+  onUserToken?: (token: string) => void | Promise<void>;
   syncHost?: string;
   /** Stable client uuid, recorded as CRDT author in .content files. */
   clientId?: string;
@@ -181,8 +254,11 @@ export async function registerDevice(
   fetchFn: FetchFn,
   code: string,
   deviceID: string = uuid4(),
+  timeoutSignal: TimeoutSignal = defaultTimeoutSignal,
 ): Promise<string> {
   const res = await fetchFn(`${AUTH_HOST}/token/json/2/device/new`, {
+    redirect: "error",
+    signal: timeoutSignal(60_000),
     method: "POST",
     headers: { Authorization: "Bearer", "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -191,14 +267,10 @@ export async function registerDevice(
       deviceID,
     }),
   });
-  const text = await res.text();
   if (!res.ok) {
-    throw new RemarkableError(
-      `Pairing failed (${res.status}): ${text}`,
-      res.status,
-    );
+    throw new RemarkableError(`Pairing failed (${res.status})`, res.status);
   }
-  return text.trim();
+  return dec.decode(await boundedBody(res, 16384)).trim();
 }
 
 /**
@@ -208,11 +280,11 @@ export async function registerDevice(
 export async function pairDevice(steps: {
   register: () => Promise<string>;
   validate: (token: string) => Promise<unknown>;
-  store: (token: string) => void;
+  store: (token: string) => void | Promise<void>;
 }): Promise<void> {
   const token = await steps.register();
   await steps.validate(token);
-  steps.store(token);
+  await steps.store(token);
 }
 
 /** Max cached index blobs (root and document indexes). */
@@ -225,20 +297,24 @@ export const META_CACHE_MAX = 1024;
 export const DEFAULT_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
 
 export class RemarkableCloud {
+  checkScope?: () => void;
   private fetch: FetchFn;
+  private timeoutSignal: TimeoutSignal;
   private userToken?: string;
   private host: string;
   /**
-   * docSchema hash -> parsed metadata, so unchanged docs aren't refetched.
+   * Document ID and docSchema hash -> parsed metadata.
    * Bounded with least-recently-used eviction.
    */
   private metaCache = new LruCache<string, RmItem>(META_CACHE_MAX);
   /**
-   * Document .docSchema blob hash -> text. Blobs are content-addressed and
-   * immutable, so caching by hash is always correct; the root pointer
-   * (getRoot) is never cached. Bounded with least-recently-used eviction.
+   * Verified document index text, keyed by ID and hash. Schema 3 indexes
+   * with identical child hashes can share a digest across different IDs.
+   * The root pointer (getRoot) is never cached.
    */
-  private indexCache = new LruCache<string, string>(INDEX_CACHE_MAX);
+  private indexCache = new LruCache<string, string>(INDEX_CACHE_MAX, (text) =>
+    Math.max(1, Math.ceil(text.length / 16384)),
+  );
   /**
    * The latest root.docSchema text. Kept apart from indexCache so a large root
    * index never evicts the small document indexes that are reused.
@@ -254,6 +330,7 @@ export class RemarkableCloud {
 
   constructor(private opts: CloudOptions) {
     this.fetch = opts.fetch;
+    this.timeoutSignal = opts.timeoutSignal ?? defaultTimeoutSignal;
     this.userToken = opts.userToken;
     this.host = opts.syncHost ?? SYNC_HOST;
     this.pageCache = new LruCache(
@@ -267,6 +344,8 @@ export class RemarkableCloud {
     for (let attempt = 0; ; attempt++) {
       try {
         res = await this.fetch(`${AUTH_HOST}/token/json/2/user/new`, {
+          redirect: "error",
+          signal: this.timeoutSignal(60_000),
           method: "POST",
           headers: { Authorization: `Bearer ${this.opts.deviceToken}` },
         });
@@ -277,15 +356,16 @@ export class RemarkableCloud {
       if (attempt >= 3) break;
       await sleep(backoff(attempt) + 500);
     }
-    const text = await res!.text();
+
     if (!res!.ok) {
       throw new RemarkableError(
-        `Could not authenticate with reMarkable (${res!.status}): ${text}`,
+        `Could not authenticate with reMarkable (${res!.status})`,
         res!.status,
       );
     }
-    this.userToken = text.trim();
-    this.opts.onUserToken?.(this.userToken);
+    const token = dec.decode(await boundedBody(res!, 16384)).trim();
+    await this.opts.onUserToken?.(token);
+    this.userToken = token;
     return this.userToken;
   }
 
@@ -311,14 +391,19 @@ export class RemarkableCloud {
     path: string,
     init: RequestInit & { headers?: Record<string, string> } = {},
     retryNetwork = true,
+    beforeSend?: () => void,
   ): Promise<Response> {
     if (this.tokenExpired()) await this.refreshUserToken();
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
+      this.checkScope?.();
+      beforeSend?.();
       let res: Response;
       try {
         res = await this.fetch(`${this.host}${path}`, {
           ...init,
+          redirect: "error",
+          signal: this.timeoutSignal(120_000),
           headers: {
             ...init.headers,
             Authorization: `Bearer ${this.userToken}`,
@@ -352,20 +437,34 @@ export class RemarkableCloud {
       return { hash: "", generation: 0, schemaVersion: 4 };
     if (!res.ok)
       throw new RemarkableError(`GET root: ${res.status}`, res.status);
-    return (await res.json()) as unknown as RootInfo;
+    const root = JSON.parse(dec.decode(await boundedBody(res, 8192)));
+    if (
+      !root ||
+      !/^[a-f0-9]{64}$/.test(root.hash) ||
+      !Number.isSafeInteger(root.generation) ||
+      root.generation < 0 ||
+      ![3, 4].includes(root.schemaVersion)
+    )
+      throw new Error("Invalid cloud root");
+    return root as RootInfo;
   }
 
-  async getBlob(hash: string, filename: string): Promise<Uint8Array> {
+  private async downloadBlob(hash: string, filename: string, limit: number) {
+    if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("Invalid blob hash");
     const res = await this.request(`/sync/v3/files/${hash}`, {
       headers: { "rm-filename": filename },
     });
     if (!res.ok) {
-      throw new RemarkableError(
-        `GET ${filename}: ${res.status} ${await res.text()}`,
-        res.status,
-      );
+      throw new RemarkableError(`GET ${filename}: ${res.status}`, res.status);
     }
-    return new Uint8Array(await res.arrayBuffer());
+    return boundedBody(res, limit);
+  }
+
+  async getBlob(hash: string, filename: string): Promise<Uint8Array> {
+    const bytes = await this.downloadBlob(hash, filename, 16 * 1024 * 1024);
+    if ((await sha256Hex(bytes)) !== hash)
+      throw new Error(`Downloaded file hash mismatch (${filename})`);
+    return bytes;
   }
 
   async getText(hash: string, filename: string) {
@@ -395,10 +494,7 @@ export class RemarkableCloud {
       body: bytes as BodyInit,
     });
     if (!res.ok) {
-      throw new RemarkableError(
-        `PUT ${filename}: ${res.status} ${await res.text()}`,
-        res.status,
-      );
+      throw new RemarkableError(`PUT ${filename}: ${res.status}`, res.status);
     }
     return hash;
   }
@@ -433,12 +529,27 @@ export class RemarkableCloud {
     return data;
   }
 
-  /** Text of an index (.docSchema) blob, cached by its immutable hash. */
-  private async getIndexText(hash: string, filename: string): Promise<string> {
-    const cached = this.indexCache.get(hash);
-    if (cached !== undefined) return cached;
-    const text = await this.getText(hash, filename);
-    this.indexCache.set(hash, text);
+  private async downloadIndex(hash: string, id: string): Promise<string> {
+    const root = id === ".";
+    const filename = root ? "root.docSchema" : `${id}.docSchema`;
+    const bytes = await this.downloadBlob(hash, filename, 8 * 1024 * 1024);
+    const text = dec.decode(bytes);
+    const { schema, entries } = parseIndex(text, id);
+    let digestInput = bytes;
+    if (schema === 3) {
+      // Legacy indexes address the ordered list of binary child hashes.
+      // Schema 4 indexes and regular files address the response bytes.
+      digestInput = new Uint8Array(entries.length * 32);
+      for (const [index, entry] of entries.entries()) {
+        digestInput.set(fromHex(entry.hash), index * 32);
+      }
+    }
+    if ((await sha256Hex(digestInput)) !== hash) {
+      const kind = root ? "root" : "document";
+      throw new Error(
+        `Downloaded ${kind} index hash mismatch (schema ${schema})`,
+      );
+    }
     return text;
   }
 
@@ -446,19 +557,23 @@ export class RemarkableCloud {
     if (!root.hash) return [];
     let text = this.rootText?.hash === root.hash ? this.rootText.text : "";
     if (!text) {
-      text = await this.getText(root.hash, "root.docSchema");
+      text = await this.downloadIndex(root.hash, ".");
       this.rootText = { hash: root.hash, text };
     }
-    return parseIndex(text).entries;
+    return parseIndex(text, ".").entries;
   }
 
   async getDocEntries(entry: {
     id: string;
     hash: string;
   }): Promise<IndexEntry[]> {
-    return parseIndex(
-      await this.getIndexText(entry.hash, `${entry.id}.docSchema`),
-    ).entries;
+    const key = `${entry.id}\0${entry.hash}`;
+    let text = this.indexCache.get(key);
+    if (text === undefined) {
+      text = await this.downloadIndex(entry.hash, entry.id);
+      this.indexCache.set(key, text);
+    }
+    return parseIndex(text, entry.id).entries;
   }
 
   /**
@@ -468,6 +583,7 @@ export class RemarkableCloud {
    */
   async updateRoot(
     mutate: (entries: IndexEntry[]) => Promise<IndexEntry[]> | IndexEntry[],
+    beforeCommit?: () => void,
   ) {
     for (let attempt = 0; attempt < 5; attempt++) {
       const root = await this.getRoot();
@@ -475,7 +591,7 @@ export class RemarkableCloud {
       const text = serializeIndex(".", entries);
       const hash = await this.putBlob("root.docSchema", text);
       try {
-        await this.putRoot(hash, root.generation);
+        await this.putRoot(hash, root.generation, beforeCommit);
         return;
       } catch (e) {
         if (!(e instanceof ConflictError)) throw e;
@@ -486,7 +602,11 @@ export class RemarkableCloud {
     );
   }
 
-  private async putRoot(hash: string, generation: number) {
+  private async putRoot(
+    hash: string,
+    generation: number,
+    beforeSend?: () => void,
+  ) {
     // Never retry on network errors: this is a compare-and-swap.
     const res = await this.request(
       "/sync/v3/root",
@@ -499,13 +619,13 @@ export class RemarkableCloud {
         body: JSON.stringify({ hash, generation, broadcast: true }),
       },
       false,
+      beforeSend,
     );
     if (res.ok) return;
-    const text = await res.text();
-    if (res.status === 412 || /precondition/i.test(text)) {
+    if (res.status === 412) {
       throw new ConflictError("generation conflict", res.status);
     }
-    throw new RemarkableError(`PUT root: ${res.status} ${text}`, res.status);
+    throw new RemarkableError(`PUT root: ${res.status}`, res.status);
   }
 
   /**
@@ -567,10 +687,11 @@ export class RemarkableCloud {
 
   /** Commit a brand-new document (fresh id, nothing to merge with). */
   private async commitDocument(docEntry: IndexEntry) {
-    await this.updateRoot((entries) => [
-      ...entries.filter((e) => e.id !== docEntry.id),
-      docEntry,
-    ]);
+    await this.updateRoot((entries) => {
+      if (entries.some((e) => e.id === docEntry.id))
+        throw new RemarkableError("New document ID already exists");
+      return [...entries, docEntry];
+    });
   }
 
   /**
@@ -597,6 +718,7 @@ export class RemarkableCloud {
     opts: {
       ifMissing?: "throw" | "skip";
       onChanged?: "rebuild" | "throw";
+      beforeCommit?: () => void;
     } = {},
   ): Promise<ChangedDocument> {
     const ifMissing = opts.ifMissing ?? "throw";
@@ -641,7 +763,7 @@ export class RemarkableCloud {
       }
       committed = entry.hash;
       return [...entries.filter((e) => e.id !== id), entry];
-    });
+    }, opts.beforeCommit);
     return { hash: committed, baseHash: mergedOn };
   }
 
@@ -682,9 +804,10 @@ export class RemarkableCloud {
     return out;
   }
 
-  /** Metadata of one root entry, cached by its (immutable) docSchema hash. */
+  /** Metadata of one root entry, cached by document ID and docSchema hash. */
   private async loadItem(entry: { id: string; hash: string }): Promise<RmItem> {
-    const cached = this.metaCache.get(entry.hash);
+    const key = `${entry.id}\0${entry.hash}`;
+    const cached = this.metaCache.get(key);
     if (cached) return cached;
     const files = await this.getDocEntries(entry);
     const meta = files.find((f) => f.id === `${entry.id}.metadata`);
@@ -696,7 +819,7 @@ export class RemarkableCloud {
       throw new UnreadableEntry("metadata is not an object");
     }
     const item = { id: entry.id, hash: entry.hash, metadata };
-    this.metaCache.set(entry.hash, item);
+    this.metaCache.set(key, item);
     return item;
   }
 
@@ -814,12 +937,18 @@ export class RemarkableCloud {
     pdf: Uint8Array,
     pageCount: number,
     name?: string,
+    expectedPdfHash?: string,
   ): Promise<ChangedDocument> {
     const doc = await this.openDocument(id);
     if (!doc) throw new RemarkableError(`Document ${id} not found`, 404);
     return this.changeDocument(id, doc.entry, doc.files, async (cur) => {
       // Derived from the entries the build is given, so after a conflict the
       // pages and metadata the tablet changed meanwhile are kept.
+      if (
+        expectedPdfHash &&
+        cur.files.find((f) => f.id === id + ".pdf")?.hash !== expectedPdfHash
+      )
+        throw new RemarkableError(TABLET_CHANGED);
       const updates: FileUpdate[] = [{ name: `${id}.pdf`, data: pdf }];
       const meta = await patchMetadata(id, cur, (metadata) => {
         if (name !== undefined) metadata.visibleName = name;
@@ -875,7 +1004,7 @@ export class RemarkableCloud {
   async updateDocument(
     id: string,
     changes: { pages?: Map<string, Uint8Array>; content?: unknown },
-    opts: { expectedHash?: string } = {},
+    opts: { expectedHash?: string; beforeCommit?: () => void } = {},
   ): Promise<ChangedDocument> {
     const docEntry = await this.findDocument(id);
     if (!docEntry) throw new RemarkableError(`Document ${id} not found`, 404);
@@ -901,13 +1030,16 @@ export class RemarkableCloud {
     }
     return this.changeDocument(id, docEntry, files, () => updates, {
       onChanged: "throw",
+      beforeCommit: opts.beforeCommit,
     });
   }
 
   /** Move a document to the trash (the tablet then deletes it). */
-  async trashDocument(id: string) {
+  async trashDocument(id: string, expectedHash?: string) {
     const doc = await this.openDocument(id);
     if (!doc) return;
+    if (expectedHash && doc.entry.hash !== expectedHash)
+      throw new RemarkableError(TABLET_CHANGED);
     await this.changeDocument(
       id,
       doc.entry,
@@ -919,7 +1051,7 @@ export class RemarkableCloud {
         });
         return update && [update];
       },
-      { ifMissing: "skip" },
+      { ifMissing: "skip", onChanged: expectedHash ? "throw" : "rebuild" },
     );
   }
 
@@ -951,10 +1083,21 @@ export class RemarkableCloud {
       ? JSON.parse(await this.getText(contentEntry.hash, contentEntry.id))
       : {};
     const rm = new Map<string, Uint8Array>();
-    const rmEntries = files.filter((f) => /\/[^/]+\.rm$/.test(f.id));
+    const rmEntries = files.filter((f) => f.id.endsWith(".rm"));
+    if (
+      rmEntries.some(
+        (f) =>
+          !f.id.startsWith(id + "/") || f.id.slice(id.length + 1).includes("/"),
+      ) ||
+      rmEntries.length > 20000 ||
+      rmEntries.reduce((sum, f) => sum + f.size, 0) > 64 * 1024 * 1024
+    )
+      throw new Error("Invalid or oversized page index");
     await pool(rmEntries, 3, async (f) => {
       const pageId = f.id.slice(f.id.lastIndexOf("/") + 1, -3);
-      rm.set(pageId, await this.getPageBlob(f.hash, f.id));
+      const bytes = await this.getPageBlob(f.hash, f.id);
+      if (bytes.length !== f.size) throw new Error("Invalid page length");
+      rm.set(pageId, bytes);
     });
     return { hash: entry.hash, content, rm, files };
   }
@@ -983,9 +1126,15 @@ function sleep(ms: number) {
 
 async function pool<T>(items: T[], n: number, fn: (item: T) => Promise<void>) {
   let i = 0;
+  let failure: { error: unknown } | undefined;
   await Promise.all(
     Array.from({ length: Math.min(n, items.length) }, async () => {
-      while (i < items.length) await fn(items[i++]);
+      try {
+        while (!failure && i < items.length) await fn(items[i++]);
+      } catch (error) {
+        failure = { error };
+      }
     }),
   );
+  if (failure) throw failure.error;
 }

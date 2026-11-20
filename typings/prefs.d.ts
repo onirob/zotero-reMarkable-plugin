@@ -14,6 +14,8 @@ declare namespace _ZoteroTypes {
       "appendNotesPages": boolean;
       "importHandwriting": boolean;
       "autoSyncMinutes": number;
+      "selectedLibraries": string;
+      "accountBindings": string;
     };
   }
 }

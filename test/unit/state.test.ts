@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildDetachedList, skipKeys } from "../../src/sync/detached";
+import { reviewEntries } from "../../src/sync/review";
 import {
   type DocState,
   type StateFileIO,
@@ -58,6 +59,38 @@ test("state roundtrips through save and load", async () => {
   const b = new SyncStateStore(PATH, io);
   await b.load();
   assert.equal(b.get(1, "AAAA")?.rmDocId, "rm-AAAA");
+});
+
+test("a saved single review migrates with its page and decision", async () => {
+  const review = {
+    location: "page-1/t",
+    revision: "original-revision",
+    choices: ["Keep both"],
+    decision: "Keep both",
+    reason: "Concurrent annotation changes",
+  };
+  const io = memoryIO(
+    new Map([
+      [
+        PATH,
+        JSON.stringify({
+          version: 1,
+          docs: { "1/AAAA": { ...doc("AAAA"), review } },
+        }),
+      ],
+    ]),
+  );
+  const store = new SyncStateStore(PATH, io);
+  await store.load();
+  assert.deepEqual(
+    reviewEntries(store.get(1, "AAAA")!).map(([, pending]) => pending),
+    [{ ...review, pageId: "page-1" }],
+  );
+  await store.save();
+  assert.equal(
+    JSON.parse(io.files.get(PATH)!).docs["1/AAAA"].review,
+    undefined,
+  );
 });
 
 test("save keeps the previous file as a backup", async () => {
@@ -255,7 +288,7 @@ test("the registry survives save/load and repeated forgets accumulate", async ()
   assert.deepEqual(b.getDetached(1, "AAAA").sort(), ["ANNOA", "ANNOB"]);
 });
 
-test("state files without a registry load, and tolerate a malformed one", async () => {
+test("state files without a registry load, and a malformed registry blocks sync", async () => {
   const io = memoryIO(
     new Map([
       [
@@ -265,8 +298,7 @@ test("state files without a registry load, and tolerate a malformed one", async 
     ]),
   );
   const s = new SyncStateStore(PATH, io);
-  await s.load();
-  assert.deepEqual(s.getDetached(1, "A"), []);
+  await assert.rejects(s.load(), /unreadable/);
   const old = new SyncStateStore(
     PATH,
     memoryIO(new Map([[PATH, JSON.stringify({ version: 1, docs: {} })]])),
@@ -319,7 +351,7 @@ test("a pending upload forgotten before a failing push keeps its keys excluded",
   ]);
 });
 
-test("malformed folders and detached are normalised without discarding the rest", async () => {
+test("malformed ownership registries preserve the original file for recovery", async () => {
   for (const [folders, detached] of [
     ["oops", [1, 2]],
     [["a"], "oops"],
@@ -339,19 +371,10 @@ test("malformed folders and detached are normalised without discarding the rest"
       ]),
     );
     const s = new SyncStateStore(PATH, io);
-    await s.load();
-    assert.ok(s.get(1, "AAAA"), "docs are kept");
-    assert.equal(s.getFolderId("Zotero"), undefined);
-    assert.deepEqual(s.getDetached(1, "A"), []);
-    // Writes now persist instead of throwing or being lost.
-    s.setFolderId("Zotero", "f1");
-    s.addDetached(1, "A", ["K1"]);
-    await s.save();
-    const r = new SyncStateStore(PATH, io);
-    await r.load();
-    assert.equal(r.getFolderId("Zotero"), "f1");
-    assert.deepEqual(r.getDetached(1, "A"), ["K1"]);
-    assert.ok(r.get(1, "AAAA"));
+    const raw = io.files.get(PATH);
+    await assert.rejects(s.load(), /unreadable/);
+    await assert.rejects(s.save(), /not loaded/);
+    assert.equal(io.files.get(PATH), raw);
   }
 });
 
@@ -499,4 +522,20 @@ test("a skipped save leaves the backup at the pre-session state", async () => {
   // The backup is refreshed once per load: it still holds the pre-session text.
   assert.equal(io.files.get(`${PATH}.bak`), before);
   assert.ok(JSON.parse(io.files.get(PATH)!).docs["1/NEW"]);
+});
+
+test("account migration verifies an independent backup and is safe to retry", async () => {
+  const raw = JSON.stringify({ version: 1, docs: { "1/AAAA": doc("AAAA") } });
+  const io = memoryIO(new Map([[PATH, raw]]));
+  const dest = PATH + ".account";
+  await SyncStateStore.migrateLegacy(PATH, dest, io);
+  assert.equal(io.files.get(PATH + ".before-library-selection"), raw);
+  assert.equal(io.files.get(dest), raw);
+  const state = new SyncStateStore(dest, io);
+  await state.load();
+  state.set(doc("BBBB"));
+  await state.save();
+  await SyncStateStore.migrateLegacy(PATH, dest, io);
+  assert.ok(JSON.parse(io.files.get(dest)!).docs["1/BBBB"]);
+  assert.equal(io.files.get(PATH), raw);
 });

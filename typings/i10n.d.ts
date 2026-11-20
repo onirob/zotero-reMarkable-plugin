@@ -8,6 +8,7 @@ export type FluentMessageId =
   | 'menu-reimport'
   | 'menu-remove'
   | 'menu-remove-imported'
+  | 'menu-review'
   | 'menu-submenu'
   | 'menu-sync'
   | 'menu-sync-all'

@@ -1,7 +1,7 @@
 {
   "name": "zotero-remarkable",
   "type": "module",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Two-way sync of Zotero PDFs and annotations with reMarkable tablets",
   "config": {
     "addonName": "reMarkable Sync for Zotero",
@@ -12,13 +12,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alfakini/zotero-reMarkable-plugin.git"
+    "url": "git+https://github.com/onirob/zotero-reMarkable-plugin.git"
   },
   "author": "Alan Fachini",
   "bugs": {
-    "url": "https://github.com/alfakini/zotero-reMarkable-plugin/issues"
+    "url": "https://github.com/onirob/zotero-reMarkable-plugin/issues"
   },
-  "homepage": "https://github.com/alfakini/zotero-reMarkable-plugin#readme",
+  "homepage": "https://github.com/onirob/zotero-reMarkable-plugin#readme",
   "license": "MIT",
   "scripts": {
     "start": "zotero-plugin serve",
