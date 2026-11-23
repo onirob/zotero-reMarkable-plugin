@@ -20,7 +20,11 @@ import { t } from "../l10n";
 import { notify, progress } from "../notify";
 import { getPref, setPref } from "../prefs";
 
-import { reviewEntries } from "../sync/review";
+import {
+  isWholePdfChoice,
+  reviewEntries,
+  tabletReviewFileType,
+} from "../sync/review";
 
 declare const reviewPrompt: {
   select(
@@ -33,6 +37,11 @@ declare const reviewPrompt: {
 };
 
 declare function createCloudTimeoutSignal(milliseconds: number): AbortSignal;
+declare function pickComparisonFile(
+  win: Window,
+  extension: "pdf" | "rm",
+  save?: boolean,
+): Promise<string | undefined>;
 
 export class RemarkableService {
   private engine?: SyncEngine;
@@ -218,6 +227,42 @@ export class RemarkableService {
     return out;
   }
 
+  async editableSelected(items: Zotero.Item[], restore: boolean) {
+    const engine = this.getEngine();
+    const [att, ...others] = await this.scoped(items);
+    if (!att || others.length)
+      throw new Error(
+        "Select exactly one PDF attachment in a selected library.",
+      );
+    await this.state.load();
+    if (!this.eligible(att.libraryID)) return;
+    const doc = this.state.get(att.libraryID, att.key);
+    if (!doc) throw new Error("Sync this PDF once to pair it with reMarkable.");
+    if (!restore && doc.editable) {
+      notify("Editable PDF sync is already enabled for this attachment.");
+      return;
+    }
+    const conversion = restore ? [] : engine.editablePreview(att);
+    const counts = new Map<number, number>();
+    for (const mark of conversion)
+      counts.set(mark.page, (counts.get(mark.page) ?? 0) + 1);
+    const pages = [...counts]
+      .sort(([a], [b]) => a - b)
+      .slice(0, 8)
+      .map(([page, count]) => `page ${page + 1} (${count})`);
+    const message = restore
+      ? "Restore the most recently erased ink or highlight in the original PDF and on reMarkable?"
+      : "Sync editable ink and highlights in the original PDF at its existing path? " +
+        "A verified erasure will also remove the matching mark on the other side. " +
+        (conversion.length
+          ? `\n\nZotero-only marks to compare for conversion: ${conversion.length} across ${counts.size} pages. ${pages.join(", ")}${counts.size > pages.length ? "…" : "."}\n\n`
+          : "") +
+        "The first sync pauses if it cannot verify the pairing or match the marks.";
+    if (!Zotero.getMainWindow().confirm(message)) return;
+    await engine.editableMode(att, restore);
+    await this.run(engine, [att]);
+  }
+
   async syncSelected(items: Zotero.Item[]) {
     const engine = this.getEngine();
     const atts = await this.scoped(items);
@@ -378,6 +423,15 @@ export class RemarkableService {
       return;
     const review = row.review;
     const choices = ["Decide later", ...review.choices];
+    const verifyLabel = "Verify against earlier PDF…";
+    const exportType = tabletReviewFileType(review);
+    const saveLabel =
+      exportType === "pdf"
+        ? "Save paired tablet PDF for comparison…"
+        : "Save tablet page for comparison…";
+    if (review.verifyEarlierPdf) choices.push(verifyLabel);
+    if (exportType && (exportType !== "pdf" || row.doc.tabletPdfHash))
+      choices.push(saveLabel);
     const action = { value: 0 };
     const message = [
       row.title,
@@ -396,17 +450,59 @@ export class RemarkableService {
       !action.value
     )
       return;
-    if (account !== this.account) return;
+    const selection = choices[action.value];
+    const verifyEarlier = selection === verifyLabel;
+    const save = selection === saveLabel ? exportType : undefined;
+    const path = save
+      ? await pickComparisonFile(win, save, true)
+      : verifyEarlier
+        ? await pickComparisonFile(win, "pdf")
+        : undefined;
+    if (
+      ((verifyEarlier || save) && !path) ||
+      account !== this.account ||
+      !this.eligible(row.doc.libraryID)
+    )
+      return;
+    if (save && path) {
+      await this.getEngine().saveTabletReviewFile(
+        row.att,
+        row.id,
+        review.revision,
+        path,
+      );
+      notify("Tablet comparison file saved.");
+      return;
+    }
+    const choice = verifyEarlier ? "Retry" : review.choices[action.value - 1];
+    const whole = isWholePdfChoice(choice);
+    if (whole) {
+      const fromTablet = choice === "Use reMarkable PDF";
+      const destination = fromTablet
+        ? "the original Zotero attachment"
+        : "the PDF in the existing tablet document";
+      const source = fromTablet ? "reMarkable" : "Zotero";
+      if (
+        !win.confirm(
+          `Replace ${destination} with the ${source} PDF and its editable marks?\n\n` +
+            "The plugin saves a verified recovery copy of both PDFs and the tablet’s page data before replacing anything.",
+        )
+      )
+        return;
+      if (account !== this.account || !this.eligible(row.doc.libraryID)) return;
+    }
     const report = await this.getEngine().resolve(
       row.att,
       row.id,
       review.revision,
-      review.choices[action.value - 1],
+      choice,
+      path,
     );
     notify(
       report.errors.join("\n") || "Review decision applied.",
       !!report.errors.length,
     );
+    if (report.notices.length) win.alert(report.notices.join("\n\n"));
   }
 
   /** (Re)start the periodic background sync from preferences. */

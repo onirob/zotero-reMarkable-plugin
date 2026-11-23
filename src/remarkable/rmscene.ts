@@ -98,6 +98,9 @@ export interface RmText {
 export interface RmPage {
   lines: RmLine[];
   glyphs: RmGlyph[];
+  hiddenItems?: string[];
+  /** Positive evidence that the tablet deleted an item in the given layer. */
+  wasDeleted?(id: string, parent?: string): boolean;
   text?: RmText;
   /** The root text block, even when it holds no visible text. */
   rootText?: RmText;
@@ -358,6 +361,47 @@ interface ItemEnvelope {
   left: string;
   right: string;
   deletedLength: number;
+}
+
+interface DeletionRange {
+  parent: string;
+  first: number;
+  last: number;
+}
+
+function deletionLookup(rangesByAuthor: Map<number, DeletionRange[]>) {
+  for (const ranges of rangesByAuthor.values()) {
+    ranges.sort((a, b) => a.first - b.first);
+    let write = 0;
+    for (const range of ranges) {
+      const last = ranges[write - 1];
+      if (last && last.last >= range.first) {
+        if (last.parent !== range.parent)
+          throw new RmParseError(
+            "Tablet deletion records overlap across layers",
+          );
+        last.last = Math.max(last.last, range.last);
+      } else {
+        ranges[write++] = range;
+      }
+    }
+    ranges.length = write;
+  }
+  return (id: string, parent?: string) => {
+    const [author, counter] = id.split(":").map(Number);
+    const ranges = rangesByAuthor.get(author);
+    if (!ranges || !Number.isSafeInteger(counter)) return false;
+    let low = 0;
+    let high = ranges.length;
+    while (low < high) {
+      const mid = low + Math.floor((high - low) / 2);
+      const range = ranges[mid];
+      if (counter < range.first) high = mid;
+      else if (counter > range.last) low = mid + 1;
+      else return parent === undefined || parent === range.parent;
+    }
+    return false;
+  };
 }
 
 function readItemEnvelope(t: TaggedReader): ItemEnvelope {
@@ -648,7 +692,14 @@ const BLOCK = {
   GroupItem: 0x04,
   LineItem: 0x05,
   RootText: 0x07,
+  TombstoneItem: 0x08,
+  ExtendedScene: 0x0e,
 } as const;
+
+/** Obtain the CRDT envelope without rewriting the surrounding page blocks. */
+export function sceneItemEnvelope(body: Uint8Array): ItemEnvelope {
+  return readItemEnvelope(new TaggedReader(new Reader(body)));
+}
 
 export function parseRm(data: Uint8Array): RmPage {
   const header = new TextDecoder("ascii").decode(
@@ -667,26 +718,67 @@ export function parseRm(data: Uint8Array): RmPage {
   let text: RmText | undefined;
   const authors: RmPage["authors"] = [];
   const hidden = new Set<string>();
-  const deleted = new Set<string>();
+  const deletions = new Map<number, DeletionRange[]>();
   /** child group -> parent group */
   const groupParent = new Map<string, string>();
+
+  function recordDeletion(env: ItemEnvelope) {
+    const [author, first] = env.id.split(":").map(Number);
+    const last = first + env.deletedLength - 1;
+    if (
+      t.remaining() !== 0 ||
+      env.deletedLength < 1 ||
+      env.deletedLength > 50000 ||
+      env.parent === END_MARKER ||
+      first < 1 ||
+      !Number.isSafeInteger(last) ||
+      last >= 2 ** 40
+    )
+      throw new RmParseError("Invalid tablet deletion record");
+    const ranges = deletions.get(author) ?? [];
+    ranges.push({ parent: env.parent, first, last });
+    deletions.set(author, ranges);
+    r.maxCounter = Math.max(r.maxCounter, last);
+  }
 
   let blocks = 0;
   while (r.pos + 8 <= r.length) {
     if (++blocks > 50000) throw new RmParseError("Page exceeds block limit");
     const len = r.u32();
-    r.u8(); // unknown
+    const flags = r.u8();
     const minimumVersion = r.u8();
     const version = r.u8();
     const type = r.u8();
+    const emptyExtensionVersion =
+      type === BLOCK.ExtendedScene &&
+      flags === 0 &&
+      minimumVersion === 3 &&
+      version === 3;
     if (
+      !emptyExtensionVersion &&
       minimumVersion >
-      (type === BLOCK.LineItem || type === BLOCK.TreeNode ? 2 : 1)
+        (type === BLOCK.LineItem || type === BLOCK.TreeNode ? 2 : 1)
     )
-      throw new RmParseError("Unsupported block version");
+      throw new RmParseError(
+        `Unsupported block version for tablet block 0x${type.toString(16).padStart(2, "0")} (minimum ${minimumVersion}, saved ${version})`,
+      );
     if (r.pos + len > r.length) throw new RmParseError("Truncated page block");
     t.block(len, () => {
       switch (type) {
+        case BLOCK.ExtendedScene:
+          // Merging layers can leave a version-3 extension with zero entries.
+          // Keep the reader paused if the tablet actually put data in it.
+          if (!emptyExtensionVersion || len !== 6)
+            throw new RmParseError(
+              "Unsupported tablet scene extension (block 0x0e)",
+            );
+          t.subblock(1, (size) => {
+            if (size !== 1 || t.r.u8() !== 0)
+              throw new RmParseError(
+                "Unsupported tablet scene extension contents (block 0x0e)",
+              );
+          });
+          break;
         case BLOCK.TreeNode: {
           const id = idKey(t.id(1));
           t.lww(2, (x) => x.string(2)); // label
@@ -703,16 +795,27 @@ export function parseRm(data: Uint8Array): RmPage {
           });
           break;
         }
-        case 8: {
-          const tombstone = readItemEnvelope(t);
-          if (tombstone.deletedLength !== 1)
-            throw new RmParseError("Unsupported scene deletion");
-          deleted.add(tombstone.id);
+        case BLOCK.TombstoneItem: {
+          const env = readItemEnvelope(t);
+          if (t.hasSubblock(6)) {
+            t.subblock(6, (length) => {
+              if (length !== 1 || t.r.u8() !== 0)
+                throw new RmParseError("Unsupported tablet deletion data");
+            });
+          }
+          recordDeletion(env);
           break;
         }
         case BLOCK.LineItem: {
           const env = readItemEnvelope(t);
-          if (!t.hasSubblock(6)) break; // deleted
+          if (!t.hasSubblock(6)) {
+            if (env.deletedLength) recordDeletion(env);
+            break;
+          }
+          if (env.deletedLength)
+            throw new RmParseError(
+              "Tablet stroke has both a deletion and drawing data",
+            );
           t.subblock(6, () => {
             if (
               t.r.u8() !== 3 ||
@@ -728,7 +831,14 @@ export function parseRm(data: Uint8Array): RmPage {
         }
         case BLOCK.GlyphItem: {
           const env = readItemEnvelope(t);
-          if (!t.hasSubblock(6)) break;
+          if (!t.hasSubblock(6)) {
+            if (env.deletedLength) recordDeletion(env);
+            break;
+          }
+          if (env.deletedLength)
+            throw new RmParseError(
+              "Tablet highlight has both a deletion and drawing data",
+            );
           t.subblock(6, () => {
             if (t.r.u8() !== 1) throw new RmParseError("Unsupported highlight");
             glyphs.push(readGlyph(t, env));
@@ -750,13 +860,21 @@ export function parseRm(data: Uint8Array): RmPage {
           text = readRootTextBlock(t);
           break;
         default:
-          if (![0, 1, 8, 10, 13].includes(type))
+          if (![0, 1, 10, 13].includes(type))
             throw new RmParseError("Unsupported page block " + type);
           break;
       }
     });
   }
   if (r.pos !== r.length) throw new RmParseError("Truncated page header");
+  const wasDeleted = deletionLookup(deletions);
+  if (
+    lines.some((item) => wasDeleted(item.id, item.parent)) ||
+    glyphs.some((item) => wasDeleted(item.id, item.parent))
+  )
+    throw new RmParseError(
+      "Tablet records disagree about whether a mark was erased",
+    );
 
   const isHidden = (group: string) => {
     for (
@@ -769,10 +887,14 @@ export function parseRm(data: Uint8Array): RmPage {
     return false;
   };
   return {
-    lines: lines.filter((l) => !deleted.has(l.id) && !isHidden(l.parent)),
-    glyphs: glyphs.filter((g) => !deleted.has(g.id) && !isHidden(g.parent)),
+    lines: lines.filter((l) => !isHidden(l.parent)),
+    glyphs: glyphs.filter((g) => !isHidden(g.parent)),
     text: text?.text.trim() ? text : undefined,
     rootText: text,
+    hiddenItems: [...lines, ...glyphs]
+      .filter((item) => isHidden(item.parent))
+      .map((item) => item.id),
+    wasDeleted,
     maxCounter: r.maxCounter,
     authors,
   };

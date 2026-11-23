@@ -40,6 +40,25 @@ export function registerMenus() {
           },
           {
             menuType: "menuitem",
+            l10nID: l10n("menu-editable"),
+            onShowing: (_e, ctx) =>
+              ctx.setEnabled(
+                !!ctx.items?.some((i) => plugin.service?.isTracked(i)),
+              ),
+            onCommand: (_e, ctx) => plugin.command("editable", ctx.items ?? []),
+          },
+          {
+            menuType: "menuitem",
+            l10nID: l10n("menu-restore-editable"),
+            onShowing: (_e, ctx) =>
+              ctx.setEnabled(
+                !!ctx.items?.some((i) => plugin.service?.isTracked(i)),
+              ),
+            onCommand: (_e, ctx) =>
+              plugin.command("restoreEditable", ctx.items ?? []),
+          },
+          {
+            menuType: "menuitem",
             l10nID: l10n("menu-reimport"),
             onShowing: (_e, ctx) =>
               ctx.setEnabled(

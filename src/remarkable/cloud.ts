@@ -460,8 +460,12 @@ export class RemarkableCloud {
     return boundedBody(res, limit);
   }
 
-  async getBlob(hash: string, filename: string): Promise<Uint8Array> {
-    const bytes = await this.downloadBlob(hash, filename, 16 * 1024 * 1024);
+  async getBlob(
+    hash: string,
+    filename: string,
+    limit = 16 * 1024 * 1024,
+  ): Promise<Uint8Array> {
+    const bytes = await this.downloadBlob(hash, filename, limit);
     if ((await sha256Hex(bytes)) !== hash)
       throw new Error(`Downloaded file hash mismatch (${filename})`);
     return bytes;
@@ -719,6 +723,7 @@ export class RemarkableCloud {
       ifMissing?: "throw" | "skip";
       onChanged?: "rebuild" | "throw";
       beforeCommit?: () => void;
+      removeNames?: ReadonlySet<string>;
     } = {},
   ): Promise<ChangedDocument> {
     const ifMissing = opts.ifMissing ?? "throw";
@@ -734,7 +739,9 @@ export class RemarkableCloud {
       const changed = await this.uploadFiles(updates, uploaded);
       const names = new Set(changed.map((e) => e.id));
       return this.putDocIndex(id, [
-        ...files.filter((e) => !names.has(e.id)),
+        ...files.filter(
+          (e) => !names.has(e.id) && !opts.removeNames?.has(e.id),
+        ),
         ...changed,
       ]);
     };
@@ -1003,7 +1010,12 @@ export class RemarkableCloud {
    */
   async updateDocument(
     id: string,
-    changes: { pages?: Map<string, Uint8Array>; content?: unknown },
+    changes: {
+      pages?: Map<string, Uint8Array>;
+      content?: unknown;
+      pdf?: Uint8Array;
+      removePages?: string[];
+    },
     opts: { expectedHash?: string; beforeCommit?: () => void } = {},
   ): Promise<ChangedDocument> {
     const docEntry = await this.findDocument(id);
@@ -1015,7 +1027,22 @@ export class RemarkableCloud {
       throw new RemarkableError(TABLET_CHANGED);
     }
     const files = await this.getDocEntries(docEntry);
+    const removeNames = new Set(
+      (changes.removePages ?? []).map((page) => {
+        if (!/^[\w-]+$/.test(page) || changes.pages?.has(page))
+          throw new Error("Invalid tablet page retirement");
+        return `${id}/${page}.rm`;
+      }),
+    );
+    if (
+      removeNames.size &&
+      (!changes.pdf || changes.content === undefined || !opts.expectedHash)
+    )
+      throw new Error(
+        "Retiring tablet pages requires a verified PDF replacement",
+      );
     const updates: FileUpdate[] = [];
+    if (changes.pdf) updates.push({ name: `${id}.pdf`, data: changes.pdf });
     for (const [pageId, data] of changes.pages ?? []) {
       updates.push({ name: `${id}/${pageId}.rm`, data });
     }
@@ -1031,6 +1058,7 @@ export class RemarkableCloud {
     return this.changeDocument(id, docEntry, files, () => updates, {
       onChanged: "throw",
       beforeCommit: opts.beforeCommit,
+      removeNames,
     });
   }
 

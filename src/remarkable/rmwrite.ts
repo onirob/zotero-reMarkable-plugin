@@ -12,6 +12,8 @@ import {
   HEADER,
   ParagraphStyle,
   parseRm,
+  sceneItemEnvelope,
+  type RmRect,
   type CrdtId,
   type RmParagraph,
 } from "./rmscene";
@@ -83,6 +85,10 @@ class Writer {
     this.tag(index, Tag.Byte4);
     this.u32(v);
   }
+  double(index: number, v: number) {
+    this.tag(index, Tag.Byte8);
+    this.f64(v);
+  }
   float(index: number, v: number) {
     this.tag(index, Tag.Byte4);
     this.f32(v);
@@ -120,6 +126,7 @@ class Writer {
 }
 
 interface RawBlock {
+  flags?: number;
   type: number;
   minVersion: number;
   version: number;
@@ -138,6 +145,7 @@ function splitBlocks(data: Uint8Array): RawBlock[] {
     if (pos + 8 + len > data.length) break;
     out.push({
       type,
+      flags: data[pos + 4],
       minVersion,
       version,
       body: data.subarray(pos + 8, pos + 8 + len),
@@ -152,7 +160,7 @@ function joinBlocks(blocks: RawBlock[]): Uint8Array {
   w.bytes(new TextEncoder().encode(HEADER.padEnd(43, " ")));
   for (const b of blocks) {
     w.u32(b.body.length);
-    w.u8(0);
+    w.u8(b.flags ?? 0);
     w.u8(b.minVersion);
     w.u8(b.version);
     w.u8(b.type);
@@ -381,4 +389,183 @@ export function writePageText(
     }),
   ];
   return joinBlocks(blocks);
+}
+
+export type SceneMark =
+  | {
+      kind: "ink";
+      color: number;
+      rgba: number;
+      points: number[];
+      width: number;
+    }
+  | { kind: "highlight"; color: number; rgba: number; rects: RmRect[] };
+
+/** Write native scene items and CRDT tombstones. Other page blocks are preserved. */
+export function writePageMarks(
+  existing: Uint8Array | undefined,
+  eraseIds: readonly string[],
+  marks: readonly SceneMark[],
+  opts: WriteTextOptions,
+) {
+  const data = existing ?? writePageText(undefined, [], opts);
+  const scene = parseRm(data);
+  const retained = new Set(
+    [...scene.lines, ...scene.glyphs].map((item) => item.id),
+  );
+  const removed = new Set(eraseIds);
+  if (eraseIds.some((id) => !retained.has(id)))
+    throw new Error("A tablet mark moved or is no longer readable");
+  const blocks = splitBlocks(data);
+  const ourUuid = uuidBytesLE(opts.authorUuid);
+  const authors = [...scene.authors];
+  let index = authors.find((a) => sameBytes(a.uuid, ourUuid))?.id;
+  if (!index) {
+    index = Math.max(0, ...authors.map((a) => a.id)) + 1;
+    if (index > 255) throw new Error("Too many tablet page authors");
+    authors.push({ id: index, uuid: ourUuid });
+  }
+  const author = index;
+  let counter = Math.max(16, scene.maxCounter) + 1;
+  const next = () => ({ part1: author, part2: counter++ });
+  const idOf = (key: string) => {
+    const [part1, part2] = key.split(":").map(Number);
+    return { part1, part2 };
+  };
+  const out: RawBlock[] = [];
+  if (marks.length)
+    out.push(
+      block(9, 1, 1, (w) => {
+        w.varuint(authors.length);
+        for (const a of authors)
+          w.subblock(0, (inner) => {
+            inner.varuint(a.uuid.length);
+            inner.bytes(a.uuid);
+            inner.u16(a.id);
+          });
+      }),
+    );
+  const root = { part1: 0, part2: 1 };
+  let rootExists = false;
+  const erased = new Set<string>();
+  for (const entry of blocks) {
+    if (
+      entry.type === 2 &&
+      entry.body[0] === 0x1f &&
+      entry.body[1] === 0 &&
+      entry.body[2] === 1
+    )
+      rootExists = true;
+    if (entry.type === 9 && marks.length) continue;
+    if (entry.type === 3 || entry.type === 5) {
+      const env = sceneItemEnvelope(entry.body);
+      if (removed.has(env.id)) {
+        if (erased.has(env.id)) throw new Error("Duplicate tablet mark ID");
+        erased.add(env.id);
+        out.push(
+          block(8, 1, 1, (w) => {
+            w.id(1, idOf(env.parent));
+            w.id(2, idOf(env.id));
+            w.id(3, idOf(env.left));
+            w.id(4, idOf(env.right));
+            w.int(5, 1);
+          }),
+        );
+        continue;
+      }
+    }
+    out.push(entry);
+  }
+  if (erased.size !== removed.size)
+    throw new Error("Tablet mark could not be safely erased");
+  const ids: string[] = [];
+  if (marks.length) {
+    if (!rootExists) throw new Error("Unknown tablet layer hierarchy");
+    const layer = next();
+    const layerItem = next();
+    const timestamp = next();
+    out.push(
+      block(1, 1, 1, (w) => {
+        w.id(1, layer);
+        w.id(2, ZERO);
+        w.bool(3, true);
+        w.subblock(4, (i) => i.id(1, root));
+      }),
+      block(2, 1, 2, (w) => {
+        w.id(1, layer);
+        w.lwwString(2, timestamp, "PDF annotations");
+        w.lwwBool(3, timestamp, true);
+      }),
+      block(4, 1, 1, (w) => {
+        w.id(1, root);
+        w.id(2, layerItem);
+        w.id(3, ZERO);
+        w.id(4, ZERO);
+        w.int(5, 0);
+        w.subblock(6, (inner) => {
+          inner.u8(2);
+          inner.id(2, layer);
+        });
+      }),
+    );
+    let left = ZERO;
+    for (const mark of marks) {
+      const id = next();
+      ids.push(`${id.part1}:${id.part2}`);
+      const ink = mark.kind === "ink";
+      out.push(
+        block(ink ? 5 : 3, 1, ink ? 2 : 1, (w) => {
+          w.id(1, layer);
+          w.id(2, id);
+          w.id(3, left);
+          w.id(4, ZERO);
+          w.int(5, 0);
+          w.subblock(6, (inner) => {
+            if (mark.kind === "ink") {
+              inner.u8(3);
+              inner.int(1, 15);
+              inner.int(2, mark.color);
+              inner.double(3, 1);
+              inner.float(4, 0);
+              inner.subblock(5, (points) => {
+                for (let i = 0; i < mark.points.length; i += 2) {
+                  points.f32(mark.points[i]);
+                  points.f32(mark.points[i + 1]);
+                  points.u16(0);
+                  points.u16(mark.width);
+                  points.u8(0);
+                  points.u8(255);
+                }
+              });
+              inner.id(6, id);
+              inner.int(8, mark.rgba);
+            } else {
+              inner.u8(1);
+              inner.int(4, mark.color);
+              inner.string(5, "");
+              inner.subblock(6, (rectangles) => {
+                rectangles.varuint(mark.rects.length);
+                for (const rect of mark.rects) {
+                  rectangles.f64(rect.x);
+                  rectangles.f64(rect.y);
+                  rectangles.f64(rect.w);
+                  rectangles.f64(rect.h);
+                }
+              });
+              inner.int(10, mark.rgba);
+            }
+          });
+        }),
+      );
+      left = id;
+    }
+  }
+  const bytes = joinBlocks(out);
+  const verified = parseRm(bytes);
+  const live = new Set(
+    [...verified.lines, ...verified.glyphs].map((item) => item.id),
+  );
+  if (ids.some((id) => !live.has(id)) || eraseIds.some((id) => live.has(id)))
+    throw new Error("Tablet annotation verification failed");
+  return { bytes, ids };
 }

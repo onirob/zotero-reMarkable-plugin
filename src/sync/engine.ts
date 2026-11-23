@@ -26,6 +26,7 @@ import {
   reviewEntries,
   reviewId,
   ReviewNeeded,
+  tabletReviewFileType,
   unreadable,
   type ReviewChoice,
   type SyncReview,
@@ -56,6 +57,14 @@ import {
   unchangedManagedDrawing,
   recoverDrawings,
 } from "./drawingJournal";
+import { syncEditable, type EditableSnapshot } from "./editableSync";
+import { EDITABLE_PDF_LIMIT, pdfWithoutSyncedMarks } from "./embeddedPdf";
+import {
+  samePaths,
+  roundMark,
+  validEditableMark,
+  type EditableMark,
+} from "./editableMarks";
 import { buildDetachedList } from "./detached";
 import {
   canSaveCandidate,
@@ -127,6 +136,7 @@ export class SyncEngine {
     id: string,
     revision: string,
     choice: ReviewChoice,
+    earlierPdfPath?: string,
   ) {
     return this.lock.run(async () => {
       this.guard(att.libraryID);
@@ -137,18 +147,118 @@ export class SyncEngine {
       if (
         !review ||
         review.revision !== revision ||
-        !review.choices.includes(choice)
+        !review.choices.includes(choice) ||
+        (earlierPdfPath !== undefined &&
+          (!review.verifyEarlierPdf || choice !== "Retry"))
       )
         throw new Error("Review changed. Open it again.");
       review.decision = choice;
       await this.state.save();
       try {
-        return await this.doSync([att], () => {});
+        return await this.doSync([att], () => {}, earlierPdfPath);
       } finally {
         this.cloud.checkScope = undefined;
         this.cloud.clearPageCache();
       }
     });
+  }
+
+  async saveTabletReviewFile(
+    att: Zotero.Item,
+    id: string,
+    revision: string,
+    destination: string,
+  ) {
+    return this.lock.run(async () => {
+      const guard = () => this.guard(att.libraryID);
+      guard();
+      await this.state.load();
+      guard();
+      const doc = this.state.get(att.libraryID, att.key);
+      const review = doc?.reviews?.[id];
+      const type = review && tabletReviewFileType(review);
+      if (!doc?.editable || !review || review.revision !== revision || !type)
+        throw new Error("Review changed. Open it again.");
+      if (!destination.toLowerCase().endsWith(`.${type}`))
+        throw new Error(
+          `Choose a new .${type} filename for the comparison copy.`,
+        );
+      this.cloud.checkScope = guard;
+      try {
+        const entry = await this.cloud.findDocument(doc.rmDocId);
+        const metadata = entry && (await this.cloud.readMetadata(entry));
+        if (
+          !entry ||
+          !metadata ||
+          metadata.deleted ||
+          metadata.parent === "trash"
+        )
+          throw new Error("The paired tablet document is unavailable.");
+        guard();
+        const name =
+          type === "pdf"
+            ? `${doc.rmDocId}.pdf`
+            : `${doc.rmDocId}/${review.pageId}.rm`;
+        const file = (await this.cloud.getDocEntries(entry)).find(
+          (file) => file.id === name,
+        );
+        if (!file || (type === "pdf" && file.hash !== doc.tabletPdfHash))
+          throw new Error(
+            "The tablet file could not be matched to the saved pairing.",
+          );
+        guard();
+        const bytes = await this.cloud.getBlob(
+          file.hash,
+          name,
+          type === "pdf" ? EDITABLE_PDF_LIMIT : undefined,
+        );
+        guard();
+        await IOUtils.write(destination, bytes, {
+          mode: "create",
+          flush: true,
+        });
+      } finally {
+        this.cloud.checkScope = undefined;
+      }
+    });
+  }
+
+  async editableMode(att: Zotero.Item, restore = false) {
+    await this.lock.run(async () => {
+      this.guard(att.libraryID);
+      await this.state.load();
+      const doc = this.state.get(att.libraryID, att.key);
+      if (!doc)
+        throw new Error(
+          "Sync the attachment with reMarkable once to establish its pairing",
+        );
+      if (restore) {
+        if (!doc.editable)
+          throw new Error("Enable editable PDF annotation sync first");
+        if (doc.editable.pending || doc.editable.restore)
+          throw new Error(
+            "Finish the pending PDF sync before restoring another mark",
+          );
+        const mark = doc.editable.erased.at(-1);
+        if (!mark) throw new Error("This PDF has no erased marks to restore");
+        doc.editable.restore = mark;
+      } else {
+        if (doc.editable) return;
+        if (reviewEntries(doc).length || doc.pullIncomplete)
+          throw new Error(
+            "Resolve the existing sync reviews before enabling editable PDF annotation sync",
+          );
+        doc.editable = { links: [], erased: [] };
+      }
+      this.guard(att.libraryID);
+      await this.state.save();
+    });
+  }
+
+  editablePreview(att: Zotero.Item) {
+    this.guard(att.libraryID);
+    const doc = this.state.get(att.libraryID, att.key);
+    return doc ? this.editableSeed(att, doc) : [];
   }
 
   get busy() {
@@ -189,7 +299,11 @@ export class SyncEngine {
     return out;
   }
 
-  private async doSync(attachments: Zotero.Item[], progress: Progress) {
+  private async doSync(
+    attachments: Zotero.Item[],
+    progress: Progress,
+    earlierPdfPath?: string,
+  ) {
     await this.state.load();
     const report: SyncReport = {
       uploaded: 0,
@@ -226,7 +340,7 @@ export class SyncEngine {
       progress(label, i / attachments.length);
       try {
         let doc = this.state.get(att.libraryID, att.key);
-        const entry = doc ? rootEntries.get(doc.rmDocId) : undefined;
+        let entry = doc ? rootEntries.get(doc.rmDocId) : undefined;
         const documentReview = doc?.reviews?.document;
         if (documentReview && !documentReview.decision) {
           const review = documentReview;
@@ -245,8 +359,8 @@ export class SyncEngine {
         const path = await att.getFilePathAsync();
         guard();
         if (!path) throw new Error("PDF file is missing");
-        const pdf = new Uint8Array(await IOUtils.read(path));
-        const sourceHash = await sha256Hex(pdf);
+        let pdf = new Uint8Array(await IOUtils.read(path));
+        let sourceHash = await sha256Hex(pdf);
         guard();
         const reviewed = documentReview;
         if (
@@ -261,9 +375,95 @@ export class SyncEngine {
             "A version changed since review. Retry to read both versions again.",
           );
         }
+        if (doc?.editable) {
+          if (!entry)
+            unreadable("Editable PDF", "The paired tablet document is missing");
+          const metadata = await this.cloud.readMetadata(entry);
+          guard();
+          if (!metadata || metadata.deleted || metadata.parent === "trash")
+            unreadable(
+              "Editable PDF",
+              "The paired tablet document is unavailable or in Trash",
+            );
+          const paired = doc;
+          const context = {
+            att,
+            doc: paired,
+            store: this.state,
+            cloud: this.cloud,
+            authorUuid: this.authorId,
+            guard,
+            earlierPdfPath,
+            seed: () => this.editableSeed(att, paired),
+            cleanTabletPdf: (files: EditableSnapshot) =>
+              this.adoptTabletPdf(att, paired, pdf, files),
+            wholeUploadFingerprint: (base: string) =>
+              this.uploadFingerprint(att, paired, {}, base),
+          };
+          const first = !doc.editable.base;
+          let result = await syncEditable(
+            context,
+            { path, bytes: pdf, hash: sourceHash },
+            entry,
+          );
+          if (result.resumed && result.retry) {
+            pdf = new Uint8Array(await IOUtils.read(path));
+            sourceHash = await sha256Hex(pdf);
+            result = await syncEditable(context, {
+              path,
+              bytes: pdf,
+              hash: sourceHash,
+            });
+          }
+          if (result.changed) report.updated++;
+          if (!doc.editable.base) {
+            for (const [, review] of reviewEntries(doc))
+              report.errors.push(
+                `${label}: ${new ReviewNeeded(review).message}`,
+              );
+            continue;
+          }
+          guard();
+          pdf = new Uint8Array(await IOUtils.read(path));
+          sourceHash = await sha256Hex(pdf);
+          if (sourceHash !== doc.sourcePdfHash)
+            unreadable(
+              "Editable PDF",
+              "The PDF changed after its pages were verified. Retry to compare the latest version.",
+            );
+          if (first) {
+            doc.uploadedFingerprint = this.uploadFingerprint(
+              att,
+              doc,
+              await IOUtils.stat(path),
+            );
+            await this.state.save();
+          }
+          if (result.changed || result.resumed) {
+            entry = await this.cloud.findDocument(doc.rmDocId);
+            if (!entry)
+              unreadable(
+                "Editable PDF",
+                "The paired tablet document disappeared",
+              );
+          }
+          report.removed += await this.refreshEditablePreview(
+            att,
+            doc,
+            path,
+            result.changed || first || !!doc.editable.refreshAnnotations,
+          );
+          if ("recovery" in result && result.recovery) {
+            report.notices.push(
+              `PDF replacement recovery folder\n${result.recovery}`,
+            );
+            continue;
+          }
+        }
         let replacePair = false;
         if (
           doc &&
+          !doc.editable &&
           entry &&
           (doc.sourcePdfHash !== sourceHash ||
             (documentReview?.location === "PDF" &&
@@ -433,6 +633,223 @@ export class SyncEngine {
     await this.state.save();
   }
 
+  private otherAnnotations(att: Zotero.Item, doc?: DocState) {
+    const detached = this.state.getDetached(att.libraryID, att.key);
+    const marks = zoteroAnnotations(att, doc, detached);
+    return doc?.editable
+      ? marks.filter((mark) => mark.type !== "ink" && mark.type !== "highlight")
+      : marks;
+  }
+
+  private uploadFingerprint(
+    att: Zotero.Item,
+    doc: DocState | undefined,
+    stat: { size?: number; lastModified?: number },
+    replacementBase?: string,
+  ) {
+    const detached = this.state.getDetached(att.libraryID, att.key);
+    return fingerprint({
+      annotations: this.otherAnnotations(att, doc),
+      notes: this.settings().appendNotesPages
+        ? zoteroNotes(att, doc, detached)
+        : [],
+      ...(replacementBase || doc?.editable?.base
+        ? {
+            base:
+              replacementBase ??
+              doc?.editable?.uploadBase ??
+              doc?.editable?.base,
+          }
+        : { size: stat.size, mtime: stat.lastModified }),
+      appendNotesPages: this.settings().appendNotesPages,
+    });
+  }
+
+  private editableSeed(att: Zotero.Item, doc: DocState) {
+    if (doc.editable?.base) return [];
+    const external = new Set(
+      att
+        .getAnnotations()
+        .filter((mark) => mark.annotationIsExternal)
+        .map((mark) => mark.key),
+    );
+    return zoteroAnnotations(
+      att,
+      doc,
+      this.state.getDetached(att.libraryID, att.key),
+    )
+      .filter((mark) => !external.has(mark.key))
+      .flatMap((mark) => {
+        const embedded = editableFromZotero(
+          mark.type,
+          mark.color,
+          mark.position,
+        );
+        return embedded ? [embedded] : [];
+      });
+  }
+
+  private async adoptTabletPdf(
+    att: Zotero.Item,
+    doc: DocState,
+    pdf: Uint8Array,
+    files: EditableSnapshot,
+  ) {
+    this.guard(att.libraryID);
+    const { buildRemarkablePdf } = await import("./pdfExport");
+    const clean = await pdfWithoutSyncedMarks(pdf);
+    const settings = this.settings();
+    const notes = settings.appendNotesPages
+      ? zoteroNotes(att, doc, this.state.getDetached(att.libraryID, att.key))
+      : [];
+    const built = await buildRemarkablePdf(
+      clean,
+      this.otherAnnotations(att, doc),
+      notes,
+      {
+        appendNotesPages: settings.appendNotesPages,
+        title: remarkableTitle(att),
+      },
+    );
+    if (built.appendedPageCount === doc.appendedPageCount) return built.bytes;
+    // Keep the pairing's original page IDs and any previously appended note
+    // pages. The first conversion only changes the portable marks.
+    const { PDFDocument } = await import("pdf-lib");
+    const merged = await PDFDocument.load(built.bytes, {
+      updateMetadata: false,
+    });
+    while (merged.getPageCount() > doc.originalPageCount)
+      merged.removePage(merged.getPageCount() - 1);
+    if (doc.appendedPageCount) {
+      const previous = files.files.find(
+        (file) => file.id === doc.rmDocId + ".pdf",
+      );
+      if (!previous)
+        throw new Error("The tablet's notes pages could not be verified");
+      const original = await PDFDocument.load(
+        await this.cloud.getBlob(previous.hash, previous.id, 128 * 1024 * 1024),
+      );
+      if (
+        original.getPageCount() !==
+        doc.originalPageCount + doc.appendedPageCount
+      )
+        throw new Error("The tablet notes page count changed");
+      const appended = await merged.copyPages(
+        original,
+        Array.from(
+          { length: doc.appendedPageCount },
+          (_, i) => i + doc.originalPageCount,
+        ),
+      );
+      for (const page of appended) merged.addPage(page);
+    }
+    return merged.save({ useObjectStreams: false });
+  }
+
+  private async refreshEditablePreview(
+    att: Zotero.Item,
+    doc: DocState,
+    path: string,
+    refresh: boolean,
+  ) {
+    this.guard(att.libraryID);
+    const edit = doc.editable!;
+    if (!refresh && !edit.erased.length) return 0;
+    const worker = Zotero.PDFWorker;
+    let refreshed = false;
+    if (refresh && typeof worker?.import === "function") {
+      try {
+        await worker.import(att.id, undefined, false, true);
+        refreshed = true;
+      } catch (error) {
+        Zotero.logError(error as Error);
+      }
+    }
+    this.guard(att.libraryID);
+    const external = att
+      .getAnnotations()
+      .filter((item) => item.annotationIsExternal && !item.deleted);
+    const externalMarks = external.flatMap((item) => {
+      try {
+        const mark = editableFromZotero(
+          item.annotationType,
+          item.annotationColor,
+          JSON.parse(item.annotationPosition),
+        );
+        return mark ? [mark] : [];
+      } catch {
+        return [];
+      }
+    });
+    const displayed = edit.links
+      .map((link) => link.pdf)
+      .filter((mark) => embeddedCoverage(mark, externalMarks));
+    const proof = [...displayed, ...edit.erased];
+    const reviewedPages = new Set(
+      reviewEntries(doc).map(([, review]) => review.pageId),
+    );
+    const eligible: DocState["imported"][string][] = [];
+    for (const [id, record] of Object.entries(doc.imported)) {
+      if (
+        record.kind !== "annotation" ||
+        record.removedOnTablet ||
+        !record.localHash ||
+        localSnapshot(att, record.zoteroKey) !== record.localHash
+      )
+        continue;
+      const [pageId, kind] = id.split("/");
+      const page = edit.pageIds?.indexOf(pageId) ?? -1;
+      if (page < 0 || !["i", "g", "h"].includes(kind)) continue;
+      const item = Zotero.Items.getByLibraryAndKey(
+        att.libraryID,
+        record.zoteroKey,
+      );
+      if (!item || !item.isAnnotation() || item.annotationIsExternal) continue;
+      let mark: EditableMark | undefined;
+      try {
+        mark = editableFromZotero(
+          item.annotationType,
+          item.annotationColor,
+          JSON.parse(item.annotationPosition),
+        );
+      } catch {
+        continue;
+      }
+      // Every stroke must still be embedded and displayed, or recoverable
+      // from a committed erasure of this pairing. Never retire a partial match.
+      const verified = reviewedPages.has(pageId) ? edit.erased : proof;
+      if (!mark || mark.page !== page || !embeddedCoverage(mark, verified))
+        continue;
+      eligible.push(record);
+    }
+    if (eligible.length) {
+      this.guard(att.libraryID);
+      if (
+        (await att.getFilePathAsync()) !== path ||
+        (await sha256Hex(
+          new Uint8Array(
+            await IOUtils.read(path, { maxBytes: EDITABLE_PDF_LIMIT + 1 }),
+          ),
+        )) !== doc.sourcePdfHash
+      )
+        unreadable(
+          "Editable PDF",
+          "The PDF changed before the Zotero preview could be updated.",
+        );
+    }
+    let retired = 0;
+    for (const record of eligible) {
+      this.guard(att.libraryID);
+      if (localSnapshot(att, record.zoteroKey) === record.localHash) {
+        await trashByKey(att.libraryID, record.zoteroKey);
+        retired++;
+      }
+    }
+    if (refreshed && displayed.length === edit.links.length)
+      edit.refreshAnnotations = undefined;
+    return retired;
+  }
+
   private async push(
     att: Zotero.Item,
     doc: DocState | undefined,
@@ -448,18 +865,12 @@ export class SyncEngine {
     if (!path) throw new Error("PDF file is missing");
     this.guard(att.libraryID);
     const detached = this.state.getDetached(att.libraryID, att.key);
-    const annotations = zoteroAnnotations(att, doc, detached);
+    const annotations = this.otherAnnotations(att, doc);
     const notes = this.settings().appendNotesPages
       ? zoteroNotes(att, doc, detached)
       : [];
     const stat = await IOUtils.stat(path);
-    const print = fingerprint({
-      annotations,
-      notes,
-      size: stat.size,
-      mtime: stat.lastModified,
-      appendNotesPages: this.settings().appendNotesPages,
-    });
+    const print = this.uploadFingerprint(att, doc, stat);
     const title = remarkableTitle(att);
     if (doc && !replacePair && doc.uploadedFingerprint === print) {
       // Nothing to rebuild, but a renamed item must still reach the tablet.
@@ -489,7 +900,8 @@ export class SyncEngine {
     // This realm copy is needed, so it is kept; nothing else here copies the
     // bytes before pdf-lib loads them.
     const { buildRemarkablePdf } = await import("./pdfExport");
-    const built = await buildRemarkablePdf(pdf, annotations, notes, {
+    const input = doc?.editable ? await pdfWithoutSyncedMarks(pdf) : pdf;
+    const built = await buildRemarkablePdf(input, annotations, notes, {
       appendNotesPages: this.settings().appendNotesPages,
       title,
     });
@@ -501,6 +913,11 @@ export class SyncEngine {
       doc.originalPageCount === built.originalPageCount
     ) {
       this.guard(att.libraryID);
+      if (doc.editable && built.appendedPageCount < doc.appendedPageCount)
+        unreadable(
+          "Editable PDF",
+          "Changing the notes appendix would remove existing tablet pages",
+        );
       if (built.appendedPageCount < doc.appendedPageCount)
         throw new ReviewNeeded({
           location: "PDF",
@@ -662,6 +1079,16 @@ export class SyncEngine {
       // Notebook pages pair with notes (noteSync) when the item can hold notes.
       skipInsertedPages: !!att.parentID,
     });
+    if (doc.editable)
+      candidates = candidates.filter(
+        (candidate) =>
+          !(
+            candidate.kind === "annotation" &&
+            (candidate.json.type === "ink" ||
+              candidate.json.type === "highlight") &&
+            candidate.json.position.pageIndex < doc.originalPageCount
+          ),
+      );
     // Restore word spacing in highlighted text from Zotero's text extraction.
     if (candidates.some((c) => c.kind === "annotation" && c.json.text)) {
       const pageTexts = await pageTextsOf(att);
@@ -689,9 +1116,18 @@ export class SyncEngine {
 
     const refById = new Map(refs.map((ref) => [ref.id, ref]));
     for (const ref of refs) {
-      if (unreadablePages.has(ref.id))
+      if (!unreadablePages.has(ref.id)) {
+        pageReadable(doc, ref.id);
+      } else if (
+        reviewEntries(doc).some(
+          ([, review]) =>
+            review.pageId === ref.id && tabletReviewFileType(review) === "rm",
+        )
+      ) {
+        forgetReview(doc, { pageId: ref.id, location: `Page ${ref.id}` });
+      } else {
         pageUnreadable(doc, ref.id, "Tablet page could not be fully decoded");
-      else pageReadable(doc, ref.id);
+      }
     }
 
     // Collect conflicts before saving any candidates on their pages.
@@ -932,6 +1368,7 @@ export class SyncEngine {
       importHandwriting,
     )) {
       if (pageBlocked(doc, rmKey.split("/")[0])) continue;
+      if (doc.editable && /\/(i|g|h)\//.test(rmKey)) continue;
       const rec = doc.imported[rmKey];
       if (!rec.removedOnTablet)
         report.notices.push(
@@ -970,6 +1407,8 @@ export class SyncEngine {
     const doc = this.state.get(att.libraryID, att.key);
     if (!doc) return false;
     this.guard(att.libraryID);
+    if (doc.editable?.pending)
+      throw new Error("Finish the pending editable PDF sync first");
     if (
       reviewEntries(doc).length ||
       Object.keys(doc.drawingJournal ?? {}).length ||
@@ -1004,6 +1443,7 @@ export class SyncEngine {
       const doc = this.state.get(att.libraryID, att.key);
       if (
         !doc ||
+        doc.editable?.pending ||
         reviewEntries(doc).length ||
         Object.keys(doc.drawingJournal ?? {}).length
       )
@@ -1071,6 +1511,43 @@ export class SyncEngine {
     await this.state.save();
     return n;
   }
+}
+
+function embeddedCoverage(target: EditableMark, annotations: EditableMark[]) {
+  const available = annotations
+    .filter((mark) => mark.page === target.page && mark.kind === target.kind)
+    .flatMap((mark) => mark.paths);
+  return target.paths.every((path) => {
+    const index = available.findIndex((candidate) =>
+      samePaths(
+        { ...target, paths: [path] },
+        { ...target, paths: [candidate] },
+      ),
+    );
+    if (index < 0) return false;
+    available.splice(index, 1);
+    return true;
+  });
+}
+
+function editableFromZotero(
+  type: string,
+  color: string,
+  position: import("./types").ZPosition,
+): EditableMark | undefined {
+  if (type !== "ink" && type !== "highlight") return;
+  const paths = (type === "ink" ? position.paths : position.rects)?.map(
+    (path) => path.map(roundMark),
+  );
+  if (!paths) return;
+  const mark: EditableMark = {
+    kind: type,
+    page: position.pageIndex,
+    color: color.toLowerCase(),
+    width: type === "ink" ? roundMark(position.width ?? 1) : 0,
+    paths,
+  };
+  if (validEditableMark(mark)) return mark;
 }
 
 async function pageTextsOf(att: Zotero.Item): Promise<string[]> {

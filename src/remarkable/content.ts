@@ -222,6 +222,71 @@ export function reconcileContent(
   return c;
 }
 
+/** Replace PDF-backed pages while retaining the IDs of independently inserted pages. */
+export function replacePdfPages(
+  content: any,
+  oldPdfCount: number,
+  newPdfPageIds: string[],
+  appended: number,
+  sizeInBytes: number,
+  authorId: string,
+) {
+  const refs = pageRefs(content);
+  const next = JSON.parse(JSON.stringify(content));
+  if (!next.cPages) {
+    let i = 0;
+    const created = buildPdfContent({
+      pageCount: newPdfPageIds.length,
+      sizeInBytes,
+      authorId,
+      newId: () => newPdfPageIds[i++],
+    });
+    Object.assign(next, { ...created, ...content, cPages: created.cPages });
+  }
+  const timestamp = contentAuthor(next, authorId);
+  const oldPages = new Map<string, CPage>(
+    (content.cPages?.pages ?? []).map((page: CPage) => [page.id, page]),
+  );
+  const insertions = refs.filter((ref) => ref.pdfIndex === undefined);
+  const appendix = refs
+    .filter(
+      (ref) =>
+        ref.pdfIndex !== undefined && ref.pdfIndex >= oldPdfCount - appended,
+    )
+    .sort((a, b) => a.pdfIndex! - b.pdfIndex!);
+  const width = idxWidth(
+    newPdfPageIds.length + insertions.length + appendix.length,
+  );
+  const ids = [
+    ...newPdfPageIds,
+    ...appendix.map((ref) => ref.id),
+    ...insertions.map((ref) => ref.id),
+  ];
+  const pdfCount = newPdfPageIds.length + appendix.length;
+  next.cPages.pages = ids.map((id, i) => ({
+    ...oldPages.get(id),
+    id,
+    idx: { timestamp, value: idxKey(i + 1, width) },
+    redir: { timestamp, value: i < pdfCount ? i : -1 },
+  }));
+  next.cPages.original = { timestamp, value: pdfCount };
+  next.cPages.lastOpened = { timestamp, value: ids[0] };
+  next.originalPageCount = pdfCount;
+  next.pageCount = ids.length;
+  next.sizeInBytes = String(sizeInBytes);
+  next.formatVersion = 2;
+  next.coverPageNumber = 0;
+  if (Array.isArray(next.pageTags)) {
+    const live = new Set(ids);
+    next.pageTags = next.pageTags.filter(
+      (tag: { pageId?: string }) => !tag?.pageId || live.has(tag.pageId),
+    );
+  }
+  delete next.pages;
+  delete next.redirectionPageMap;
+  return next;
+}
+
 function contentAuthor(c: any, authorId: string) {
   const cp = c.cPages;
   cp.uuids ??= [];

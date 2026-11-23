@@ -5,9 +5,11 @@
 export type FluentMessageId =
   | 'error-no-pdf'
   | 'error-not-connected'
+  | 'menu-editable'
   | 'menu-reimport'
   | 'menu-remove'
   | 'menu-remove-imported'
+  | 'menu-restore-editable'
   | 'menu-review'
   | 'menu-submenu'
   | 'menu-sync'

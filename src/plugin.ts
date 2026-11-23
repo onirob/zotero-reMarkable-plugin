@@ -15,6 +15,8 @@ export type Command =
   | "sync"
   | "syncAll"
   | "review"
+  | "editable"
+  | "restoreEditable"
   | "reimport"
   | "removeImported"
   | "remove";
@@ -71,6 +73,8 @@ export class Plugin {
       if (cmd === "review") await service.reviewConflicts();
       else if (cmd === "sync") await service.syncSelected(items);
       else if (cmd === "syncAll") await service.syncAll();
+      else if (cmd === "editable" || cmd === "restoreEditable")
+        await service.editableSelected(items, cmd === "restoreEditable");
       else if (cmd === "reimport") await service.removeImported(items, true);
       else if (cmd === "removeImported")
         await service.removeImported(items, false);

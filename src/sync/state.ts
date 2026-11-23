@@ -8,6 +8,11 @@
 
 import { rememberReview, reviewId, type SyncReview } from "./review";
 import type { DrawingIntent } from "./drawingJournal";
+import {
+  type EditableState,
+  PAGE_BASE_VERSION,
+  validEditableMark,
+} from "./editableMarks";
 import { buildDetachedList } from "./detached";
 
 export interface ImportedRecord {
@@ -43,6 +48,7 @@ export interface NotePageRecord {
 
 export interface DocState {
   sourcePdfHash?: string;
+  editable?: EditableState;
   tabletPdfHash?: string;
   pendingTabletPdfHash?: string;
   reviews?: Record<string, SyncReview>;
@@ -187,6 +193,134 @@ function parseState(text: string): StateFile {
     )
       throw new Error("Invalid or ambiguous document pairing");
     docIds.add(doc.rmDocId);
+    const edit = doc.editable;
+    const hash = (value: unknown) =>
+      typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+    const pageIds = (ids: unknown): ids is string[] =>
+      strings(ids) &&
+      new Set(ids).size === ids.length &&
+      ids.every((id) => /^[\w-]+$/.test(id) && !(id in Object.prototype));
+    const linksValid = (
+      links: EditableState["links"],
+      count = doc.originalPageCount,
+    ) =>
+      Array.isArray(links) &&
+      links.every(
+        (link) =>
+          !!link &&
+          typeof link.id === "string" &&
+          !!link.id &&
+          Array.isArray(link.native) &&
+          link.native.length > 0 &&
+          link.native.every((id) => /^\d+:\d+$/.test(id)) &&
+          (link.nativeLayers === undefined ||
+            (strings(link.nativeLayers) &&
+              link.nativeLayers.length === link.native.length &&
+              link.nativeLayers.every((id) => /^\d+:\d+$/.test(id)))) &&
+          validEditableMark(link.pdf) &&
+          validEditableMark(link.tablet) &&
+          link.pdf.page < count &&
+          link.tablet.page < count,
+      ) &&
+      new Set(links.map((link) => link.id)).size === links.length;
+    const pending = edit?.pending;
+    const whole = pending?.wholePdf;
+    const replacementCount = whole?.pageBoxes?.length ?? doc.originalPageCount;
+    if (
+      whole &&
+      (typeof whole.beforePath !== "string" ||
+        !whole.beforePath ||
+        !hash(whole.beforeDocument) ||
+        !hash(whole.backupManifest) ||
+        !hash(pending?.beforeContentHash) ||
+        !Array.isArray(whole.pageBoxes) ||
+        replacementCount < 1 ||
+        replacementCount > 20000 ||
+        whole.pageBoxes.some(
+          (box) =>
+            !box ||
+            !Number.isFinite(box.x) ||
+            !Number.isFinite(box.y) ||
+            !Number.isFinite(box.width) ||
+            box.width <= 0 ||
+            !Number.isFinite(box.height) ||
+            box.height <= 0,
+        ) ||
+        whole.appendedPageCount !== doc.appendedPageCount ||
+        !pageIds(whole.retiredPages) ||
+        (pending?.tabletPdfHash !== undefined &&
+          (!hash(pending.afterContentHash) ||
+            pending.tabletContent === undefined)) ||
+        (!pending?.tabletPdfHash && whole.retiredPages.length))
+    )
+      throw new Error("Invalid PDF replacement state");
+    if (
+      edit !== undefined &&
+      (!edit ||
+        !linksValid(edit.links) ||
+        !Array.isArray(edit.erased) ||
+        !edit.erased.every(validEditableMark) ||
+        (edit.lastPdfRecovery !== undefined &&
+          (typeof edit.lastPdfRecovery !== "string" ||
+            !/^[a-f0-9-]{36}$/.test(edit.lastPdfRecovery))) ||
+        (edit.baseVersion !== undefined &&
+          ((edit.baseVersion !== 2 && edit.baseVersion !== PAGE_BASE_VERSION) ||
+            !edit.base)) ||
+        (edit.uploadBase !== undefined &&
+          (!hash(edit.uploadBase) || !edit.base)) ||
+        (edit.restore !== undefined && !validEditableMark(edit.restore)) ||
+        (edit.base !== undefined &&
+          (!hash(edit.base) ||
+            !pageIds(edit.pageIds) ||
+            edit.pageIds.length !== doc.originalPageCount)) ||
+        (edit.pending !== undefined &&
+          (!edit.pending ||
+            !/^[a-f0-9-]{36}$/.test(edit.pending.id) ||
+            !hash(edit.pending.base) ||
+            (edit.pending.baseVersion !== undefined &&
+              edit.pending.baseVersion !== 2 &&
+              edit.pending.baseVersion !== PAGE_BASE_VERSION) ||
+            !hash(edit.pending.beforePdf) ||
+            !hash(edit.pending.afterPdf) ||
+            !hash(edit.pending.beforeTabletPdf) ||
+            (edit.pending.tabletPdfHash !== undefined &&
+              !hash(edit.pending.tabletPdfHash)) ||
+            !pageIds(edit.pending.pageIds) ||
+            edit.pending.pageIds.length !== replacementCount ||
+            !edit.pending.observedPages ||
+            (!whole &&
+              Object.keys(edit.pending.observedPages).length !==
+                doc.originalPageCount) ||
+            (whole &&
+              (!isPlainObject(edit.pending.observedPages) ||
+                !pageIds(Object.keys(edit.pending.observedPages)) ||
+                Object.entries(edit.pending.observedPages).some(
+                  ([, value]) => value !== "" && !hash(value),
+                ) ||
+                whole.retiredPages.some(
+                  (id) =>
+                    edit.pending!.pageIds.includes(id) ||
+                    !Object.hasOwn(edit.pending!.observedPages, id),
+                ))) ||
+            !edit.pending.pageIds.every(
+              (id) =>
+                hash(edit.pending!.observedPages[id]) ||
+                edit.pending!.observedPages[id] === "",
+            ) ||
+            !linksValid(edit.pending.links, replacementCount) ||
+            !Array.isArray(edit.pending.erased) ||
+            !edit.pending.erased.every(validEditableMark) ||
+            !Array.isArray(edit.pending.pages) ||
+            !edit.pending.pages.every(
+              (p) =>
+                p &&
+                edit.pending!.pageIds.includes(p.id) &&
+                hash(p.hash) &&
+                edit.pending!.observedPages[p.id] === p.before,
+            ) ||
+            !strings(edit.pending.resolved))))
+    )
+      throw new Error("Invalid editable-annotation sync state");
     if (
       !Number.isSafeInteger(doc.originalPageCount) ||
       doc.originalPageCount < 0 ||
@@ -264,6 +398,10 @@ function parseState(text: string): StateFile {
       typeof review.location === "string" &&
       typeof review.revision === "string" &&
       (review.pageId === undefined || typeof review.pageId === "string") &&
+      (review.verifyEarlierPdf === undefined ||
+        (review.verifyEarlierPdf === true &&
+          review.location === "PDF page layout" &&
+          review.pageId === undefined)) &&
       Array.isArray(review.choices) &&
       review.choices.length > 0 &&
       review.choices.every((choice) =>
@@ -272,6 +410,8 @@ function parseState(text: string): StateFile {
           "Keep both",
           "Use tablet version",
           "Use Zotero version",
+          "Use reMarkable PDF",
+          "Use Zotero PDF",
         ].includes(choice),
       ) &&
       (review.decision === undefined ||
@@ -451,6 +591,12 @@ export class SyncStateStore {
     }
     await this.io.writeText(this.path, text);
     this.lastWritten = text;
+  }
+
+  editableStage(id: string) {
+    if (!/^[a-f0-9-]{36}$/.test(id))
+      throw new Error("Invalid annotation transaction ID");
+    return `${this.path}.annotations-${id}`;
   }
 
   pendingAttachments() {

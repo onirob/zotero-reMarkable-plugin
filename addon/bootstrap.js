@@ -8,6 +8,35 @@ let chromeRegistration;
 
 function install() {}
 
+function pickComparisonFile(win, extension, save = false) {
+  const { nsIFilePicker } = Components.interfaces;
+  const picker =
+    Components.classes["@mozilla.org/filepicker;1"].createInstance(
+      nsIFilePicker,
+    );
+  picker.init(
+    win.browsingContext,
+    save
+      ? "Save a tablet comparison file"
+      : "Select the PDF saved before editing",
+    save ? nsIFilePicker.modeSave : nsIFilePicker.modeOpen,
+  );
+  picker.appendFilter(
+    extension === "rm" ? "reMarkable pages" : "PDF files",
+    `*.${extension}`,
+  );
+  picker.defaultExtension = extension;
+  if (save) picker.defaultString = `reMarkable-comparison.${extension}`;
+  picker.addToRecentDocs = false;
+  return new Promise((resolve) => {
+    picker.open((result) =>
+      resolve(
+        result === nsIFilePicker.returnOK ? picker.file?.path : undefined,
+      ),
+    );
+  });
+}
+
 async function startup({ rootURI }) {
   const addonManager = Components.classes[
     "@mozilla.org/addons/addon-manager-startup;1"
@@ -23,6 +52,7 @@ async function startup({ rootURI }) {
     {
       credentialManager: Services.logins,
       reviewPrompt: Services.prompt,
+      pickComparisonFile,
       createCloudTimeoutSignal: (milliseconds) => {
         // The plugin scope has fetch but may lack window Web APIs.
         const Signal =

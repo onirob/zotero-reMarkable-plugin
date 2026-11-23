@@ -4,7 +4,16 @@ export type ReviewChoice =
   | "Keep both"
   | "Use tablet version"
   | "Use Zotero version"
+  | "Use reMarkable PDF"
+  | "Use Zotero PDF"
   | "Retry";
+
+export type WholePdfChoice = "Use reMarkable PDF" | "Use Zotero PDF";
+export function isWholePdfChoice(
+  choice: ReviewChoice | undefined,
+): choice is WholePdfChoice {
+  return choice === "Use reMarkable PDF" || choice === "Use Zotero PDF";
+}
 
 export interface SyncReview {
   location: string;
@@ -15,10 +24,25 @@ export interface SyncReview {
   revision: string;
   choices: ReviewChoice[];
   decision?: ReviewChoice;
+  verifyEarlierPdf?: true;
   /** Snapshots to verify again before executing a saved choice. */
   tabletHash?: string;
   localKey?: string;
   localHash?: string;
+}
+
+export const PDF_PAGE_LAYOUT_REVIEW = "PDF page layout";
+
+export function tabletReviewFileType(review: SyncReview) {
+  if (review.location === PDF_PAGE_LAYOUT_REVIEW && !review.pageId)
+    return "pdf";
+  if (
+    review.pageId &&
+    /^[\w-]+$/.test(review.pageId) &&
+    /^Embedded annotations · page \d+$/.test(review.location) &&
+    review.choices.includes("Retry")
+  )
+    return "rm";
 }
 
 export class ReviewNeeded extends Error {

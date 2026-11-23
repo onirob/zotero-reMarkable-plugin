@@ -28,4 +28,5 @@ Install a built `.xpi`: quit Zotero, copy it into the profile's extensions direc
 ## Invariants
 
 - Never modify or delete Zotero objects the user created. Only objects recorded in `DocState.imported` may be changed.
-- Imported annotations are never burned back into the uploaded PDF, and the original PDF in Zotero is never changed.
+- Imported annotations are never burned back into the uploaded PDF. Only attachments explicitly opted into editable annotation sync may update their original PDF, through the verified recovery journal.
+- Keep editable PDF fingerprints versioned. Verify a legacy pairing against its saved baseline before migrating it. A mismatch must preserve the pairing, the annotation history, and both copies across retries and restarts.

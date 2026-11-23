@@ -34,6 +34,45 @@ Zotero ──── PDF + Zotero highlights/notes ────▶ reMarkable
 
 Imported annotations and notes get the tag `reMarkable import` and author name "reMarkable". This is separate from the `reMarkable` tag used to mark items for sync.
 
+### Editable ink and highlights in the original PDF
+
+Pair the attachment first using **Sync with reMarkable**, then right-click the
+attachment and choose **reMarkable → Enable editable annotations in this PDF…**.
+The confirmation previews any Zotero-only marks eligible for conversion.
+This opt-in mode uses the same original attachment and tablet document.
+
+- Ink and highlights appear as standard editable annotations in the PDF
+  and native marks on the tablet. In a PDF editor, save to the same file.
+  On the tablet, select the **PDF annotations** layer to erase or move marks
+  sent from the PDF.
+  The first sync uses a verified copy of the original page layout to adopt
+  the pairing. Freehand tablet highlights are represented by PDF highlight
+  rectangles. Tablet brush effects are represented as portable ink geometry.
+- A verified erasure syncs to the other side. **Restore last erased PDF
+  annotation…** recovers the last synced geometry in the original PDF and on
+  the tablet. Open **Tools → Review sync conflicts** for changes made on both
+  sides or when the plugin cannot verify a page. **Keep both** can retain
+  both marks in one PDF.
+  For a pending **Unsupported scene deletion** review from an older build,
+  choose **Retry** after updating.
+  A later sync moves an unchanged legacy Zotero overlay to Trash when the
+  sync history accounts for all its strokes.
+- A locked file pauses the write. Close the editor and choose **Retry**.
+  When an older pairing needs a previous page baseline, **Verify against
+  earlier PDF…** reads a saved copy for comparison while keeping the edited
+  file at its current path.
+  A page-layout review can save the paired tablet PDF for comparison.
+  A tablet decoding review can save the affected `.rm` page.
+  When a genuine layout conflict can be verified, choose **Use reMarkable
+  PDF** to replace the original Zotero file, or **Use Zotero PDF** to replace
+  the PDF in the existing tablet document. The review asks for confirmation.
+  Zotero shows the recovery folder after the operation. It contains the prior
+  Zotero PDF, the tablet source PDF, the tablet page data, and an annotated
+  tablet PDF when the tablet marks could be decoded.
+  Files with a changed page layout, a digital signature, or unsupported
+  page geometry require review. Start with one expendable paper to verify
+  your PDF editor and tablet firmware.
+
 ### Notes ↔ note pages (two-way)
 
 A child note whose title starts with **`reMarkable Note`** (e.g. `reMarkable Note 1`,
@@ -55,10 +94,9 @@ Other child notes are read-only on the tablet: they are listed on the appended
 ### Safety rules
 
 - Sync is opt-in for each writable library. Unchecking a library pauses its pairings and reviews.
-- Erasing a tablet annotation retains its Zotero import. A failed import stays pending. Re-import refreshes existing records in place.
-
-- The original PDF file in Zotero is never changed; the annotated copy only exists
-  on the tablet.
+- In the default mode, erasing a tablet annotation retains its Zotero import
+  and the original PDF file stays intact. A failed import stays pending.
+  Re-import refreshes existing records in place.
 - Imported annotations are never burned back into the uploaded PDF, so nothing
   appears twice.
 
